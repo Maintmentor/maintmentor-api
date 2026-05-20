@@ -40,5 +40,12 @@
     "inputTokens": 18108,
     "outputTokens": 2083,
     "warnings": []
+  },
+  "2026-05-20": {
+    "totalCost": 0.019845,
+    "requestCount": 2,
+    "inputTokens": 3005,
+    "outputTokens": 722,
+    "warnings": []
   }
 }

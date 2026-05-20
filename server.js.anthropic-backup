@@ -1,7 +1,7 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Anthropic = require('@anthropic-ai/sdk');
 const { v4: uuidv4 } = require('uuid');
 const { incrementQueryCount, incrementPhotoCount, registerUsageRoutes, ensureTable } = require('./usage-tracking');
 const { registerTeamRoutes } = require('./team-manager');
@@ -18,26 +18,22 @@ const { registerSession, isSessionValid, refreshSession } = require('./security/
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-  console.error('❌ GEMINI_API_KEY not set in .env — cannot start');
-  process.exit(1);
-}
-const MODEL_PRO = process.env.GEMINI_MODEL || 'gemini-2.5-pro';
-const MODEL_FLASH = process.env.GEMINI_MODEL_FLASH || 'gemini-2.5-flash';
-const MODEL = MODEL_PRO; // default for health check display
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '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';
+const MODEL_SONNET = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const MODEL_HAIKU = process.env.ANTHROPIC_MODEL_HAIKU || 'claude-haiku-4-5';
+const MODEL = MODEL_SONNET; // default for health check display
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ─── Two-Tier Model Router ─────────────────────────────────────────────────────
 // Routes simple questions to Haiku (cheap/fast), complex ones to Sonnet (smart)
 function selectModel(question, hasPhotos, historyLength) {
-  // ALWAYS use Pro for:
+  // ALWAYS use Sonnet for:
   // 1. Photo analysis — needs strong vision capabilities
-  if (hasPhotos) return { model: MODEL_PRO, reason: 'photo-analysis' };
+  if (hasPhotos) return { model: MODEL_SONNET, reason: 'photo-analysis' };
 
   // 2. Long conversations (6+ messages) — needs better context tracking
-  if (historyLength >= 6) return { model: MODEL_PRO, reason: 'long-conversation' };
+  if (historyLength >= 6) return { model: MODEL_SONNET, reason: 'long-conversation' };
 
   const q = question.toLowerCase();
 
@@ -53,7 +49,7 @@ function selectModel(question, hasPhotos, historyLength) {
     'permit', 'code violation', 'inspection',
   ];
   if (safetyCritical.some(term => q.includes(term))) {
-    return { model: MODEL_PRO, reason: 'safety-critical' };
+    return { model: MODEL_SONNET, reason: 'safety-critical' };
   }
 
   // 4. Complex diagnostic patterns — multi-symptom, troubleshooting chains
@@ -71,11 +67,11 @@ function selectModel(question, hasPhotos, historyLength) {
     /could (it|this) be/i,
   ];
   if (complexPatterns.some(pat => pat.test(q))) {
-    return { model: MODEL_PRO, reason: 'complex-diagnostic' };
+    return { model: MODEL_SONNET, reason: 'complex-diagnostic' };
   }
 
-  // Everything else → Flash (simple how-tos, basic info, quick tips)
-  return { model: MODEL_FLASH, reason: 'simple-query' };
+  // Everything else → Haiku (simple how-tos, basic info, quick tips)
+  return { model: MODEL_HAIKU, reason: 'simple-query' };
 }
 
 // ─── System Prompt ─────────────────────────────────────────────────────────────
@@ -217,9 +213,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'maintmentor-api',
-    models: { pro: MODEL_PRO, flash: MODEL_FLASH },
-    routing: 'two-tier (flash for simple, pro for complex/photos/safety)',
-    engine: 'gemini',
+    models: { sonnet: MODEL_SONNET, haiku: MODEL_HAIKU },
+    routing: 'two-tier (haiku for simple, sonnet for complex/photos/safety)',
     timestamp: new Date().toISOString(),
     dailySpend: spend.today.totalCost?.toFixed(2) || '0.00',
     dailyRequests: spend.today.requestCount || 0,
@@ -382,64 +377,41 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    // Build conversation history in Gemini format
-    const history = getConversationHistory(conversationId);
-    const geminiHistory = [];
-    for (const msg of history) {
-      const role = msg.role === 'assistant' ? 'model' : 'user';
-      if (typeof msg.content === 'string') {
-        geminiHistory.push({ role, parts: [{ text: msg.content }] });
-      } else if (Array.isArray(msg.content)) {
-        const parts = msg.content
-          .filter(c => c.type === 'text')
-          .map(c => ({ text: c.text }));
-        if (parts.length) geminiHistory.push({ role, parts });
-      } else {
-        geminiHistory.push({ role, parts: [{ text: String(msg.content) }] });
-      }
-    }
-
-    // Build current user message parts
-    const userParts = [];
+    // Build current message content
+    const content = [];
 
     if (hasPhotos) {
       for (const imageUrl of images) {
-        try {
-          const imgResp = await fetch(imageUrl);
-          const imgBuffer = Buffer.from(await imgResp.arrayBuffer());
-          const mimeType = imgResp.headers.get('content-type') || 'image/jpeg';
-          userParts.push({
-            inlineData: { mimeType, data: imgBuffer.toString('base64') }
-          });
-        } catch (imgErr) {
-          console.error(`[${new Date().toISOString()}] Image fetch failed: ${imgErr.message}`);
-        }
+        content.push({
+          type: 'image',
+          source: { type: 'url', url: imageUrl }
+        });
       }
     }
 
-    userParts.push({ text: question });
+    content.push({ type: 'text', text: question });
 
-    // ─── MODEL SELECTION: Route to Flash or Pro ──────────────────────
+    const history = getConversationHistory(conversationId);
+    const messages = [...history, { role: 'user', content }];
+
+    // ─── MODEL SELECTION: Route to Haiku or Sonnet ──────────────────
     const modelChoice = selectModel(question, hasPhotos, history.length);
     const selectedModel = modelChoice.model;
 
-    console.log(`[${new Date().toISOString()}] Sending ${geminiHistory.length + 1} messages (${geminiHistory.length} history + 1 new) → ${selectedModel} (${modelChoice.reason})`);
+    console.log(`[${new Date().toISOString()}] Sending ${messages.length} messages (${history.length} history + 1 new) → ${selectedModel} (${modelChoice.reason})`);
 
-    const geminiModel = genAI.getGenerativeModel({
+    const response = await anthropic.messages.create({
       model: selectedModel,
-      systemInstruction: SYSTEM_PROMPT,
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      messages
     });
 
-    const chat = geminiModel.startChat({
-      history: geminiHistory,
-      generationConfig: { maxOutputTokens: 4096 },
-    });
+    const answer = response.content
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('\n\n');
 
-    const geminiResponse = await chat.sendMessage(userParts);
-    const answer = geminiResponse.response.text();
-
-    // Store in Anthropic-compatible format for backward compat
-    const content = [{ type: 'text', text: question }];
     addToConversation(conversationId, content, answer);
 
     const category = detectCategory(question, answer);
@@ -454,11 +426,9 @@ app.post('/api/chat', async (req, res) => {
     }).catch(() => {});
 
     // ─── CONTROL 5: Record API spend ──────────────────────────────────────
-    // Gemini usage metadata
-    const usageMeta = geminiResponse.response?.usageMetadata;
     const spendInfo = recordSpend(
-      usageMeta?.promptTokenCount || 0,
-      usageMeta?.candidatesTokenCount || 0,
+      response.usage?.input_tokens,
+      response.usage?.output_tokens,
       selectedModel
     );
 
@@ -479,8 +449,8 @@ app.post('/api/chat', async (req, res) => {
       model: selectedModel,
       modelReason: modelChoice.reason,
       usage: {
-        inputTokens: usageMeta?.promptTokenCount || 0,
-        outputTokens: usageMeta?.candidatesTokenCount || 0
+        inputTokens: response.usage?.input_tokens,
+        outputTokens: response.usage?.output_tokens
       },
       dailyUsage: {
         queryCount: rateLimitCheck.queryCount + 1,
