@@ -1,0 +1,44 @@
+{
+  "2026-04-24": {
+    "totalCost": 0.7390049999999999,
+    "requestCount": 48,
+    "inputTokens": 158715,
+    "outputTokens": 17524,
+    "warnings": []
+  },
+  "2026-04-25": {
+    "totalCost": 0.08077500000000001,
+    "requestCount": 7,
+    "inputTokens": 12855,
+    "outputTokens": 2814,
+    "warnings": []
+  },
+  "2026-04-28": {
+    "totalCost": 0.009624,
+    "requestCount": 1,
+    "inputTokens": 1488,
+    "outputTokens": 344,
+    "warnings": []
+  },
+  "2026-05-02": {
+    "totalCost": 0.037389,
+    "requestCount": 5,
+    "inputTokens": 7432,
+    "outputTokens": 2751,
+    "warnings": []
+  },
+  "2026-05-03": {
+    "totalCost": 0.107632,
+    "requestCount": 10,
+    "inputTokens": 27839,
+    "outputTokens": 5281,
+    "warnings": []
+  },
+  "2026-05-17": {
+    "totalCost": 0.064599,
+    "requestCount": 5,
+    "inputTokens": 18108,
+    "outputTokens": 2083,
+    "warnings": []
+  }
+}

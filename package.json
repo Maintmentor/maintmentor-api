@@ -1,0 +1,20 @@
+{
+  "name": "maintmentor-api",
+  "version": "1.0.0",
+  "description": "MaintMentor.ai API server — Claude-powered maintenance mentor",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.104.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.0",
+    "google-img-scrap": "^1.1.8",
+    "stripe": "^22.1.0",
+    "uuid": "^10.0.0"
+  }
+}
