@@ -657,7 +657,8 @@ registerHeroRoutes(app);
 registerBillingRoutes(app);
 
 // ─── Start Server ──────────────────────────────────────────────────────────────
-app.listen(PORT, '127.0.0.1', async () => {
+const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
+app.listen(PORT, HOST, async () => {
   console.log(`🔧 MaintMentor API running on 127.0.0.1:${PORT}`);
   console.log(`   Model: ${MODEL}`);
   console.log(`   Health: http://127.0.0.1:${PORT}/api/health`);
