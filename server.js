@@ -252,7 +252,13 @@ app.get('/api/session/validate', async (req, res) => {
   res.json({ success: true, valid });
 });
 
-// ─── Conversation Memory Store ─────────────────────────────────────────────────
+// ─── Conversation Memory Store (In-memory cache + Supabase persistence) ──────
+const { createClient: createSupabaseClient } = require('@supabase/supabase-js');
+const chatDb = createSupabaseClient(
+  process.env.SUPABASE_URL || 'https://rxzbnvvtzhgogeuhajvp.supabase.co',
+  process.env.SUPABASE_SERVICE_KEY || 'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+);
+
 const conversationStore = new Map();
 const MAX_HISTORY = 20;
 const CONVERSATION_TTL = 2 * 60 * 60 * 1000;
@@ -266,28 +272,106 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
-function getConversationHistory(conversationId) {
-  if (!conversationId || !conversationStore.has(conversationId)) return [];
-  return conversationStore.get(conversationId).messages;
+async function getConversationHistory(conversationId) {
+  if (conversationId && conversationStore.has(conversationId)) {
+    return conversationStore.get(conversationId).messages;
+  }
+  if (!conversationId) return [];
+  try {
+    const { data } = await chatDb
+      .from('chat_messages')
+      .select('role, content')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true })
+      .limit(MAX_HISTORY * 2);
+    if (data && data.length > 0) {
+      conversationStore.set(conversationId, {
+        messages: data.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+        lastActivity: Date.now()
+      });
+      return conversationStore.get(conversationId).messages;
+    }
+  } catch (err) {
+    console.error('[chat-history] Failed to load from DB:', err.message);
+  }
+  return [];
 }
 
 function addToConversation(conversationId, userContent, assistantText) {
   if (!conversationId) return;
-  
   if (!conversationStore.has(conversationId)) {
     conversationStore.set(conversationId, { messages: [], lastActivity: Date.now() });
   }
-  
   const conv = conversationStore.get(conversationId);
   conv.lastActivity = Date.now();
-  conv.messages.push({ role: 'user', content: userContent });
+  const userText = typeof userContent === 'string' ? userContent :
+    (Array.isArray(userContent) ? userContent.filter(c => c.type === 'text').map(c => c.text).join(' ') : String(userContent));
+  conv.messages.push({ role: 'user', content: userText });
   conv.messages.push({ role: 'assistant', content: assistantText });
-  
   while (conv.messages.length > MAX_HISTORY * 2) {
     conv.messages.shift();
     conv.messages.shift();
   }
 }
+
+async function persistConversation(conversationId, userId, question, answer, images, model, tokensIn, tokensOut, category) {
+  if (!userId || !conversationId) return;
+  try {
+    const { data: existing } = await chatDb.from('conversations').select('id').eq('id', conversationId).maybeSingle();
+    if (!existing) {
+      await chatDb.from('conversations').insert({ id: conversationId, user_id: userId });
+    }
+    await chatDb.from('chat_messages').insert([
+      { conversation_id: conversationId, user_id: userId, role: 'user', content: question, images: images && images.length > 0 ? images : null },
+      { conversation_id: conversationId, user_id: userId, role: 'assistant', content: answer, model, tokens_in: tokensIn, tokens_out: tokensOut, category }
+    ]);
+  } catch (err) {
+    console.error('[chat-history] Persist failed (non-blocking):', err.message);
+  }
+}
+
+// ─── Conversation List/History API ───────────────────────────────────────────
+app.get('/api/conversations', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
+  try {
+    const { data, error } = await chatDb.from('conversations')
+      .select('id, title, created_at, updated_at, message_count, is_archived')
+      .eq('user_id', userId).eq('is_archived', false)
+      .order('updated_at', { ascending: false }).limit(50);
+    if (error) throw error;
+    res.json({ success: true, conversations: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to load conversations' });
+  }
+});
+
+app.get('/api/conversations/:id/messages', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId || !req.params.id) return res.status(400).json({ success: false, error: 'userId required' });
+  try {
+    const { data, error } = await chatDb.from('chat_messages')
+      .select('id, role, content, images, model, category, created_at')
+      .eq('conversation_id', req.params.id).eq('user_id', userId)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json({ success: true, messages: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to load messages' });
+  }
+});
+
+app.delete('/api/conversations/:id', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
+  try {
+    await chatDb.from('conversations').update({ is_archived: true }).eq('id', req.params.id).eq('user_id', userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to delete conversation' });
+  }
+});
+
 
 // ─── Chat Endpoint (with all security controls) ────────────────────────────────
 app.post('/api/chat', async (req, res) => {
@@ -383,7 +467,7 @@ app.post('/api/chat', async (req, res) => {
 
   try {
     // Build conversation history in Gemini format
-    const history = getConversationHistory(conversationId);
+    const history = await getConversationHistory(conversationId);
     const geminiHistory = [];
     for (const msg of history) {
       const role = msg.role === 'assistant' ? 'model' : 'user';
@@ -505,6 +589,18 @@ app.post('/api/chat', async (req, res) => {
         console.error('[Hero] XP award failed (non-blocking):', err.message);
       });
     }
+
+    // ─── Persist conversation to Supabase (non-blocking) ──────────────
+    persistConversation(
+      conversationId || result.conversationId,
+      userId, question, answer, images,
+      selectedModel,
+      usageMeta?.promptTokenCount || 0,
+      usageMeta?.candidatesTokenCount || 0,
+      category
+    ).catch(err => {
+      console.error('[chat-history] Persist failed (non-blocking):', err.message);
+    });
 
   } catch (err) {
     const duration = Date.now() - startTime;
