@@ -10,6 +10,7 @@
 
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const { notifyNewSubscriber, notifyPaymentFailed, notifySubscriptionCancelled } = require('./notifications');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -210,6 +211,10 @@ async function handleCheckoutCompleted(session) {
   }).eq('id', profile.id);
 
   console.log(`[stripe-webhook] checkout.session.completed — user ${profile.id} now paid`);
+
+  // Notify Dean
+  const { data: userProfile } = await supabase.from('profiles').select('email, full_name').eq('id', profile.id).maybeSingle();
+  notifyNewSubscriber(profile.id, userProfile?.email || userProfile?.full_name || 'Unknown');
 }
 
 async function handleInvoicePaid(invoice) {
@@ -248,6 +253,10 @@ async function handlePaymentFailed(invoice) {
   }).eq('id', profile.id);
 
   console.log(`[stripe-webhook] invoice.payment_failed — user ${profile.id} now past_due`);
+
+  // Notify Dean
+  const { data: failedProfile } = await supabase.from('profiles').select('email, full_name').eq('id', profile.id).maybeSingle();
+  notifyPaymentFailed(profile.id, failedProfile?.email || 'Unknown');
 }
 
 async function handleSubscriptionUpdated(subscription) {
@@ -298,6 +307,10 @@ async function handleSubscriptionDeleted(subscription) {
   }).eq('id', profile.id);
 
   console.log(`[stripe-webhook] subscription.deleted — user ${profile.id} now cancelled`);
+
+  // Notify Dean
+  const { data: cancelledProfile } = await supabase.from('profiles').select('email, full_name').eq('id', profile.id).maybeSingle();
+  notifySubscriptionCancelled(profile.id, cancelledProfile?.email || 'Unknown');
 }
 
 // ─── Register JSON-parsed Billing Routes ────────────────────────────────────────
