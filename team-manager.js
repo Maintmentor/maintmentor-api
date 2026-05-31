@@ -6,11 +6,13 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const { Resend } = require('resend');
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://rxzbnvvtzhgogeuhajvp.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || 'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU';
 const APP_URL = process.env.APP_URL || 'https://maintmentor.ai';
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -26,6 +28,51 @@ function slugify(text) {
 
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Send invite email via Resend.
+ */
+async function sendInviteEmail({ toEmail, inviterName, orgName, inviteLink }) {
+  try {
+    await resend.emails.send({
+      from: 'MaintMentor <support@maintmentor.ai>',
+      to: toEmail,
+      subject: `${inviterName} invited you to join ${orgName} on MaintMentor`,
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:560px;margin:40px auto;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);overflow:hidden">
+    <div style="background:#1e293b;padding:28px 32px;text-align:center">
+      <img src="https://maintmentor.ai/icons/maintmentor-logo.png" alt="MaintMentor" style="height:48px;width:48px;object-fit:contain;border-radius:8px" />
+      <h1 style="color:#f59e0b;font-size:22px;margin:12px 0 0;font-weight:700">MaintMentor</h1>
+    </div>
+    <div style="padding:32px">
+      <h2 style="color:#1e293b;font-size:20px;margin:0 0 12px">You're invited! 🎉</h2>
+      <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 8px">
+        <strong>${inviterName}</strong> has invited you to join <strong>${orgName}</strong> on MaintMentor — the AI-powered maintenance knowledge platform.
+      </p>
+      <p style="color:#475569;font-size:14px;line-height:1.6;margin:0 0 28px">
+        Click the button below to set up your account. No credit card required — your team subscription covers your access.
+      </p>
+      <div style="text-align:center;margin:0 0 28px">
+        <a href="${inviteLink}" style="display:inline-block;background:#f59e0b;color:#1e293b;text-decoration:none;font-weight:700;font-size:15px;padding:14px 32px;border-radius:8px">Join the Team →</a>
+      </div>
+      <p style="color:#94a3b8;font-size:12px;text-align:center;margin:0">
+        This invite expires in 7 days. If you didn't expect this email, you can ignore it.
+      </p>
+    </div>
+  </div>
+</body>
+</html>`,
+    });
+    console.log(`[team-manager] Invite email sent to ${toEmail}`);
+  } catch (err) {
+    // Non-fatal — link still works
+    console.error(`[team-manager] Failed to send invite email to ${toEmail}:`, err.message);
+  }
 }
 
 /**
@@ -262,6 +309,24 @@ function registerTeamRoutes(app) {
 
       const inviteLink = `${APP_URL}/invite/${token}`;
       console.log(`[team-manager] Invite created for ${email} → ${inviteLink}`);
+
+      // Send invite email (non-blocking)
+      const { data: inviterProfile } = await supabase
+        .from('profiles')
+        .select('full_name, email')
+        .eq('id', user.id)
+        .maybeSingle();
+      const { data: orgForEmail } = await supabase
+        .from('organizations')
+        .select('name')
+        .eq('id', orgId)
+        .single();
+      sendInviteEmail({
+        toEmail: email,
+        inviterName: inviterProfile?.full_name || inviterProfile?.email || 'Your manager',
+        orgName: orgForEmail?.name || 'your team',
+        inviteLink,
+      });
 
       res.json({
         success: true,
@@ -609,6 +674,116 @@ function registerTeamRoutes(app) {
 
     } catch (err) {
       console.error('[team-manager] get-members error:', err.message);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
+  // ─── RESEND INVITE ──────────────────────────────────────────────────────────
+  app.post('/api/team/resend-invite', async (req, res) => {
+    try {
+      const user = await getUserFromRequest(req);
+      if (!user) return res.status(401).json({ success: false, error: 'Unauthorized' });
+
+      const { orgId, memberId } = req.body;
+      if (!orgId || !memberId) {
+        return res.status(400).json({ success: false, error: 'orgId and memberId are required' });
+      }
+
+      if (!(await isOrgAdmin(user.id, orgId))) {
+        return res.status(403).json({ success: false, error: 'Only org admins can resend invites' });
+      }
+
+      // Get member
+      const { data: member } = await supabase
+        .from('organization_members')
+        .select('id, invited_email, status, invited_by')
+        .eq('id', memberId)
+        .eq('org_id', orgId)
+        .maybeSingle();
+
+      if (!member) return res.status(404).json({ success: false, error: 'Member not found' });
+      if (member.status !== 'invited') {
+        return res.status(400).json({ success: false, error: 'Member has already accepted the invite' });
+      }
+
+      // Expire old tokens and create a fresh one
+      await supabase
+        .from('organization_invites')
+        .update({ accepted_at: new Date().toISOString() }) // mark as consumed so old link stops working
+        .eq('member_id', memberId)
+        .is('accepted_at', null);
+
+      const token = generateToken();
+      await supabase.from('organization_invites').insert({
+        org_id: orgId,
+        member_id: memberId,
+        token,
+        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      });
+
+      // Update member invited_at
+      await supabase
+        .from('organization_members')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', memberId);
+
+      const inviteLink = `${APP_URL}/invite/${token}`;
+
+      // Get inviter + org info and send email
+      const { data: inviterProfile } = await supabase
+        .from('profiles').select('full_name, email').eq('id', user.id).maybeSingle();
+      const { data: org } = await supabase
+        .from('organizations').select('name').eq('id', orgId).single();
+
+      sendInviteEmail({
+        toEmail: member.invited_email,
+        inviterName: inviterProfile?.full_name || inviterProfile?.email || 'Your manager',
+        orgName: org?.name || 'your team',
+        inviteLink,
+      });
+
+      console.log(`[team-manager] Invite resent to ${member.invited_email}`);
+      res.json({ success: true, inviteLink });
+
+    } catch (err) {
+      console.error('[team-manager] resend-invite error:', err.message);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
+  // ─── GET INVITE LINK (for existing invited member) ─────────────────────────
+  app.get('/api/team/invite-link/:memberId', async (req, res) => {
+    try {
+      const user = await getUserFromRequest(req);
+      if (!user) return res.status(401).json({ success: false, error: 'Unauthorized' });
+
+      const { memberId } = req.params;
+      const orgId = req.query.orgId;
+      if (!orgId) return res.status(400).json({ success: false, error: 'orgId is required' });
+
+      if (!(await isOrgAdmin(user.id, orgId))) {
+        return res.status(403).json({ success: false, error: 'Only org admins can view invite links' });
+      }
+
+      // Get the latest active token for this member
+      const { data: invite } = await supabase
+        .from('organization_invites')
+        .select('token, expires_at')
+        .eq('member_id', memberId)
+        .is('accepted_at', null)
+        .gt('expires_at', new Date().toISOString())
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!invite) {
+        return res.status(404).json({ success: false, error: 'No active invite found. Use resend to create a new one.' });
+      }
+
+      res.json({ success: true, inviteLink: `${APP_URL}/invite/${invite.token}`, expiresAt: invite.expires_at });
+
+    } catch (err) {
+      console.error('[team-manager] get-invite-link error:', err.message);
       res.status(500).json({ success: false, error: 'Internal server error' });
     }
   });
