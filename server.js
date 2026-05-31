@@ -1079,3 +1079,26 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ─── Auto-confirm email after signup (bypasses Supabase email verification) ───
+app.post('/api/auth/confirm-email', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
+
+    const { createClient } = require('@supabase/supabase-js');
+    const admin = createClient(
+      'https://rxzbnvvtzhgogeuhajvp.supabase.co',
+      'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+    );
+
+    const { error } = await admin.auth.admin.updateUser(userId, { email_confirm: true });
+    if (error) throw new Error(error.message);
+
+    console.log(`[auth] Email auto-confirmed for user ${userId}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[auth] confirm-email error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
