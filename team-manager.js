@@ -234,6 +234,16 @@ function registerTeamRoutes(app) {
         if (existingInvite.status === 'invited') {
           return res.status(409).json({ success: false, error: 'This person has already been invited. You can resend the invite.' });
         }
+        // status === 'disabled' — previously removed, re-invite by reactivating
+        if (existingInvite.status === 'disabled') {
+          const now = new Date().toISOString();
+          await supabase
+            .from('organization_members')
+            .update({ status: 'invited', user_id: null, invited_by: user.id, joined_at: null, disabled_at: null, updated_at: now })
+            .eq('id', existingInvite.id);
+          // Fall through using existingInvite.id as member
+          existingInvite.status = 'invited'; // mark so we use it below
+        }
       }
 
       // Check if the email user already belongs to another org
@@ -243,27 +253,33 @@ function registerTeamRoutes(app) {
         .eq('email', email.toLowerCase())
         .maybeSingle();
 
-      if (existingUser?.org_id) {
+      if (existingUser?.org_id && existingUser.org_id !== orgId) {
         return res.status(409).json({ success: false, error: 'This person is already a member of another organization' });
       }
 
-      // Create member record
-      const { data: member, error: memberError } = await supabase
-        .from('organization_members')
-        .insert({
-          org_id: orgId,
-          role: 'member',
-          status: 'invited',
-          invited_email: email.toLowerCase(),
-          invited_phone: phone || null,
-          invited_by: user.id,
-        })
-        .select()
-        .single();
+      // Reuse reactivated disabled record, or create a new one
+      let member;
+      if (existingInvite?.status === 'invited') {
+        member = { id: existingInvite.id };
+      } else {
+        const { data: newMember, error: memberError } = await supabase
+          .from('organization_members')
+          .insert({
+            org_id: orgId,
+            role: 'member',
+            status: 'invited',
+            invited_email: email.toLowerCase(),
+            invited_phone: phone || null,
+            invited_by: user.id,
+          })
+          .select()
+          .single();
 
-      if (memberError) {
-        console.error('[team-manager] Invite member error:', memberError);
-        return res.status(500).json({ success: false, error: 'Failed to create invite' });
+        if (memberError) {
+          console.error('[team-manager] Invite member error:', memberError);
+          return res.status(500).json({ success: false, error: 'Failed to create invite' });
+        }
+        member = newMember;
       }
 
       // Create invite token
