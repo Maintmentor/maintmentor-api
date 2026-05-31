@@ -950,3 +950,62 @@ app.post('/api/videos/model-lookup', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ─── Verification Email Route ──────────────────────────────────────────────────
+// Bypasses Supabase Edge Functions — sends directly via Resend
+app.post('/api/auth/send-verification-email', async (req, res) => {
+  try {
+    const { to, token, userName, action } = req.body;
+    if (!to || !token) {
+      return res.status(400).json({ success: false, error: 'to and token are required' });
+    }
+
+    const { Resend } = require('resend');
+    const resendClient = new Resend(process.env.RESEND_API_KEY);
+
+    const APP_URL = 'https://maintmentor.ai';
+    const verificationUrl = `${APP_URL}/verify-email?token=${token}`;
+    const shortCode = token.substring(0, 6).toUpperCase();
+
+    await resendClient.emails.send({
+      from: 'MaintMentor <support@maintmentor.ai>',
+      to: [to],
+      subject: action === 'resend'
+        ? 'Your new MaintMentor verification code'
+        : 'Verify your MaintMentor email address',
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:560px;margin:40px auto;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);overflow:hidden">
+    <div style="background:#1e293b;padding:28px 32px;text-align:center">
+      <img src="${APP_URL}/icons/maintmentor-logo.png" alt="MaintMentor" style="height:48px;width:48px;object-fit:contain;border-radius:8px" />
+      <h1 style="color:#f59e0b;font-size:22px;margin:12px 0 0;font-weight:700">MaintMentor</h1>
+    </div>
+    <div style="padding:32px">
+      <h2 style="color:#1e293b;font-size:20px;margin:0 0 12px">Verify your email 🔧</h2>
+      <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 8px">Hi ${userName || 'there'}, welcome to MaintMentor!</p>
+      <p style="color:#475569;font-size:14px;line-height:1.6;margin:0 0 24px">Click below to verify your email and get full access.</p>
+      <div style="text-align:center;margin:0 0 24px">
+        <a href="${verificationUrl}" style="display:inline-block;background:#f59e0b;color:#1e293b;text-decoration:none;font-weight:700;font-size:15px;padding:14px 32px;border-radius:8px">Verify My Email →</a>
+      </div>
+      <p style="color:#64748b;font-size:13px;margin:0 0 8px">Or enter this code on the verification page:</p>
+      <div style="background:#f1f5f9;border-radius:8px;padding:14px;text-align:center;letter-spacing:6px;font-size:24px;font-weight:700;color:#1e293b;margin:0 0 24px">${shortCode}</div>
+      <p style="color:#94a3b8;font-size:12px;margin:0">Expires in 24 hours. Didn't sign up? Ignore this email.</p>
+    </div>
+    <div style="background:#f8fafc;padding:16px 32px;text-align:center;border-top:1px solid #e2e8f0">
+      <p style="color:#94a3b8;font-size:12px;margin:0">© 2026 MaintMentor.ai — All rights reserved</p>
+    </div>
+  </div>
+</body>
+</html>`,
+    });
+
+    console.log(`[auth] Verification email sent to ${to}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[auth] send-verification-email error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
