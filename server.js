@@ -1009,3 +1009,73 @@ app.post('/api/auth/send-verification-email', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ─── Resend Verification Email (bypass missing Supabase RPC) ─────────────────
+app.post('/api/auth/resend-verification', async (req, res) => {
+  try {
+    const { userId, userEmail, userName } = req.body;
+    if (!userId || !userEmail) {
+      return res.status(400).json({ success: false, error: 'userId and userEmail are required' });
+    }
+
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(
+      'https://rxzbnvvtzhgogeuhajvp.supabase.co',
+      'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+    );
+
+    // Generate a new token and store it
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(16).toString('hex');
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+    const { error: updateError } = await sb
+      .from('profiles')
+      .update({ verification_token: token, verification_token_expires_at: expiresAt, updated_at: new Date().toISOString() })
+      .eq('id', userId);
+
+    if (updateError) throw new Error(updateError.message);
+
+    // Send email via Resend
+    const { Resend } = require('resend');
+    const resendClient = new Resend(process.env.RESEND_API_KEY);
+    const APP_URL = 'https://maintmentor.ai';
+    const verificationUrl = `${APP_URL}/verify-email?token=${token}`;
+    const shortCode = token.substring(0, 6).toUpperCase();
+
+    await resendClient.emails.send({
+      from: 'MaintMentor <support@maintmentor.ai>',
+      to: [userEmail],
+      subject: 'Your new MaintMentor verification code',
+      html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:560px;margin:40px auto;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);overflow:hidden">
+    <div style="background:#1e293b;padding:28px 32px;text-align:center">
+      <img src="${APP_URL}/icons/maintmentor-logo.png" alt="MaintMentor" style="height:48px;width:48px;object-fit:contain;border-radius:8px" />
+      <h1 style="color:#f59e0b;font-size:22px;margin:12px 0 0;font-weight:700">MaintMentor</h1>
+    </div>
+    <div style="padding:32px">
+      <h2 style="color:#1e293b;font-size:20px;margin:0 0 12px">Verify your email 🔧</h2>
+      <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 24px">Hi ${userName || 'there'}, here's your new verification link.</p>
+      <div style="text-align:center;margin:0 0 24px">
+        <a href="${verificationUrl}" style="display:inline-block;background:#f59e0b;color:#1e293b;text-decoration:none;font-weight:700;font-size:15px;padding:14px 32px;border-radius:8px">Verify My Email →</a>
+      </div>
+      <p style="color:#64748b;font-size:13px;margin:0 0 8px">Or enter this code on the verification page:</p>
+      <div style="background:#f1f5f9;border-radius:8px;padding:14px;text-align:center;letter-spacing:6px;font-size:24px;font-weight:700;color:#1e293b;margin:0 0 24px">${shortCode}</div>
+      <p style="color:#94a3b8;font-size:12px;margin:0">Expires in 24 hours.</p>
+    </div>
+  </div>
+</body>
+</html>`,
+    });
+
+    console.log(`[auth] Verification resent to ${userEmail}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[auth] resend-verification error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
