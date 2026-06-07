@@ -545,4 +545,365 @@ router.get('/wallet/solana-address', async (req, res) => {
   }
 });
 
+// ─── GET /wallet/balance ────────────────────────────────────────────────────────
+/**
+ * Get full wallet summary for the authenticated user.
+ *
+ * Response:
+ *   200 {
+ *     balance_credits: N,
+ *     balance_usd: N,
+ *     solana_address: "..." | null,
+ *     auto_recharge_enabled: false,
+ *     stripe_customer_id: "..." | null
+ *   }
+ */
+router.get('/wallet/balance', async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const { data: wallet, error } = await supabase
+      .from('wallets')
+      .select('id, balance_usd, solana_address, auto_recharge_enabled, stripe_customer_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({
+          error: 'Wallet not found',
+          code: 'WALLET_NOT_FOUND',
+        });
+      }
+      console.error('GET /wallet/balance error:', error.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve wallet balance',
+        code: 'WALLET_FETCH_FAILED',
+      });
+    }
+
+    return res.status(200).json({
+      balance_credits: wallet.balance_usd,          // 1 balance_usd unit = 1 credit
+      balance_usd: wallet.balance_usd,
+      solana_address: wallet.solana_address || null,
+      auto_recharge_enabled: wallet.auto_recharge_enabled || false,
+      stripe_customer_id: wallet.stripe_customer_id || null,
+    });
+  } catch (err) {
+    console.error('GET /dashboard/wallet/balance error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+// ─── GET /wallet/transactions ──────────────────────────────────────────────────
+/**
+ * Get paginated transaction history for the authenticated user's wallet.
+ *
+ * Query params:
+ *   limit  — default 20, max 100
+ *   offset — default 0
+ *
+ * Response:
+ *   200 { transactions: [...], total: N, limit: N, offset: N }
+ */
+router.get('/wallet/transactions', async (req, res) => {
+  const userId = req.user.id;
+
+  // Parse + clamp pagination params
+  let limit  = parseInt(req.query.limit,  10) || 20;
+  let offset = parseInt(req.query.offset, 10) || 0;
+  if (limit  < 1)   limit  = 1;
+  if (limit  > 100) limit  = 100;
+  if (offset < 0)   offset = 0;
+
+  try {
+    // Look up wallet_id for this user
+    const { data: wallet, error: walletError } = await supabase
+      .from('wallets')
+      .select('id')
+      .eq('user_id', userId)
+      .single();
+
+    if (walletError) {
+      if (walletError.code === 'PGRST116') {
+        return res.status(404).json({
+          error: 'Wallet not found',
+          code: 'WALLET_NOT_FOUND',
+        });
+      }
+      console.error('GET /wallet/transactions wallet lookup error:', walletError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve wallet',
+        code: 'WALLET_FETCH_FAILED',
+      });
+    }
+
+    // Fetch transactions with count
+    const { data: transactions, error: txError, count } = await supabase
+      .from('wallet_transactions')
+      .select(
+        'id, amount_usd, type, description, created_at, token_mint, stripe_payment_intent_id',
+        { count: 'exact' }
+      )
+      .eq('wallet_id', wallet.id)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (txError) {
+      console.error('GET /wallet/transactions fetch error:', txError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve transactions',
+        code: 'TX_FETCH_FAILED',
+      });
+    }
+
+    return res.status(200).json({
+      transactions: transactions || [],
+      total:  count  || 0,
+      limit,
+      offset,
+    });
+  } catch (err) {
+    console.error('GET /dashboard/wallet/transactions error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+// ─── GET /usage/summary ──────────────────────────────────────────────────────
+/**
+ * Get usage summary (today / this month / lifetime) for the authenticated user.
+ *
+ * Response:
+ *   200 {
+ *     today:      { queries: N, photos: N, credits_used: N },
+ *     this_month: { queries: N, photos: N, credits_used: N },
+ *     lifetime:   { queries: N, photos: N, credits_used: N },
+ *     top_categories: [{ category: "electrical", count: N }]
+ *   }
+ */
+router.get('/usage/summary', async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    // Look up wallet_id
+    const { data: wallet, error: walletError } = await supabase
+      .from('wallets')
+      .select('id')
+      .eq('user_id', userId)
+      .single();
+
+    if (walletError) {
+      if (walletError.code === 'PGRST116') {
+        // No wallet yet — return zeroed stats
+        return res.status(200).json({
+          today:      { queries: 0, photos: 0, credits_used: 0 },
+          this_month: { queries: 0, photos: 0, credits_used: 0 },
+          lifetime:   { queries: 0, photos: 0, credits_used: 0 },
+          top_categories: [],
+        });
+      }
+      console.error('GET /usage/summary wallet lookup error:', walletError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve wallet',
+        code: 'WALLET_FETCH_FAILED',
+      });
+    }
+
+    const now = new Date();
+    const todayStart = new Date(now);
+    todayStart.setUTCHours(0, 0, 0, 0);
+
+    const monthStart = new Date(now);
+    monthStart.setUTCDate(1);
+    monthStart.setUTCHours(0, 0, 0, 0);
+
+    const walletId = wallet.id;
+
+    // Fetch all usage logs for this wallet (lifetime)
+    const { data: logs, error: logsError } = await supabase
+      .from('api_usage_logs')
+      .select('endpoint, credits_charged, created_at')
+      .eq('wallet_id', walletId)
+      .order('created_at', { ascending: false });
+
+    if (logsError) {
+      console.error('GET /usage/summary logs fetch error:', logsError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve usage logs',
+        code: 'USAGE_FETCH_FAILED',
+      });
+    }
+
+    const allLogs = logs || [];
+
+    // Helper: classify endpoint as query or photo
+    function isPhoto(endpoint) {
+      return endpoint && endpoint.includes('/photo');
+    }
+    function isQuery(endpoint) {
+      return endpoint && endpoint.includes('/query');
+    }
+
+    // Aggregate helper
+    function aggregate(items) {
+      return items.reduce(
+        (acc, log) => {
+          acc.credits_used += (log.credits_charged || 0);
+          if (isQuery(log.endpoint)) acc.queries++;
+          else if (isPhoto(log.endpoint)) acc.photos++;
+          return acc;
+        },
+        { queries: 0, photos: 0, credits_used: 0 }
+      );
+    }
+
+    const todayLogs    = allLogs.filter(l => new Date(l.created_at) >= todayStart);
+    const monthLogs    = allLogs.filter(l => new Date(l.created_at) >= monthStart);
+
+    // Top categories — extracted from endpoint or metadata if available
+    // Bucket by endpoint path segment (last path component)
+    const categoryCounts = {};
+    for (const log of allLogs) {
+      const ep = log.endpoint || 'unknown';
+      // e.g. "/api/agent/query" → "query", "/api/agent/photo" → "photo"
+      const parts = ep.split('/');
+      const cat = parts[parts.length - 1] || 'other';
+      categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+    }
+    const topCategories = Object.entries(categoryCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([category, count]) => ({ category, count }));
+
+    return res.status(200).json({
+      today:      aggregate(todayLogs),
+      this_month: aggregate(monthLogs),
+      lifetime:   aggregate(allLogs),
+      top_categories: topCategories,
+    });
+  } catch (err) {
+    console.error('GET /dashboard/usage/summary error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+// ─── GET /usage/chart ─────────────────────────────────────────────────────────
+/**
+ * Get daily usage data for charting.
+ *
+ * Query params:
+ *   days — number of days to include (default 30, max 90)
+ *
+ * Response:
+ *   200 {
+ *     labels:  ["2026-06-01", ...],
+ *     queries: [N, N, ...],
+ *     credits: [N, N, ...]
+ *   }
+ */
+router.get('/usage/chart', async (req, res) => {
+  const userId = req.user.id;
+
+  let days = parseInt(req.query.days, 10) || 30;
+  if (days < 1)  days = 1;
+  if (days > 90) days = 90;
+
+  try {
+    // Look up wallet_id
+    const { data: wallet, error: walletError } = await supabase
+      .from('wallets')
+      .select('id')
+      .eq('user_id', userId)
+      .single();
+
+    if (walletError) {
+      if (walletError.code === 'PGRST116') {
+        // No wallet — return empty chart with correct number of data points
+        const labels   = [];
+        const queries  = [];
+        const credits  = [];
+        const now = new Date();
+        for (let i = days - 1; i >= 0; i--) {
+          const d = new Date(now);
+          d.setUTCDate(d.getUTCDate() - i);
+          d.setUTCHours(0, 0, 0, 0);
+          labels.push(d.toISOString().slice(0, 10));
+          queries.push(0);
+          credits.push(0);
+        }
+        return res.status(200).json({ labels, queries, credits });
+      }
+      console.error('GET /usage/chart wallet lookup error:', walletError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve wallet',
+        code: 'WALLET_FETCH_FAILED',
+      });
+    }
+
+    const now = new Date();
+    const rangeStart = new Date(now);
+    rangeStart.setUTCDate(rangeStart.getUTCDate() - (days - 1));
+    rangeStart.setUTCHours(0, 0, 0, 0);
+
+    // Fetch usage logs in range
+    const { data: logs, error: logsError } = await supabase
+      .from('api_usage_logs')
+      .select('endpoint, credits_charged, created_at')
+      .eq('wallet_id', wallet.id)
+      .gte('created_at', rangeStart.toISOString())
+      .order('created_at', { ascending: true });
+
+    if (logsError) {
+      console.error('GET /usage/chart logs fetch error:', logsError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve usage logs',
+        code: 'USAGE_FETCH_FAILED',
+      });
+    }
+
+    // Build a map: "YYYY-MM-DD" → { queries, credits }
+    const dayMap = {};
+    for (const log of (logs || [])) {
+      const dateKey = new Date(log.created_at).toISOString().slice(0, 10);
+      if (!dayMap[dateKey]) dayMap[dateKey] = { queries: 0, credits: 0 };
+      dayMap[dateKey].credits += (log.credits_charged || 0);
+      if (log.endpoint && log.endpoint.includes('/query')) dayMap[dateKey].queries++;
+      else if (log.endpoint && log.endpoint.includes('/photo')) dayMap[dateKey].queries++; // photos count as queries for charting
+    }
+
+    // Build ordered arrays for all `days` calendar days
+    const labels  = [];
+    const queries = [];
+    const credits = [];
+
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now);
+      d.setUTCDate(d.getUTCDate() - i);
+      d.setUTCHours(0, 0, 0, 0);
+      const dateKey = d.toISOString().slice(0, 10);
+      labels.push(dateKey);
+      queries.push((dayMap[dateKey] || {}).queries || 0);
+      credits.push((dayMap[dateKey] || {}).credits || 0);
+    }
+
+    return res.status(200).json({ labels, queries, credits });
+  } catch (err) {
+    console.error('GET /dashboard/usage/chart error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
 module.exports = router;
+

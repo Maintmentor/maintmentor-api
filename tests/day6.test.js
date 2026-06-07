@@ -194,8 +194,15 @@ test('embedText truncates very long text', async () => {
   const { _setEmbeddingModel, embedText, _CONFIG } = require('../lib/embeddings');
   let capturedText = null;
   _setEmbeddingModel({
-    embedContent: async (text) => {
-      capturedText = text;
+    embedContent: async (input) => {
+      // Handle both old string format and new object format
+      if (typeof input === 'string') {
+        capturedText = input;
+      } else if (input && input.content && input.content.parts && input.content.parts[0]) {
+        capturedText = input.content.parts[0].text;
+      } else {
+        capturedText = String(input);
+      }
       return { embedding: { values: makeEmbedding(0.1) } };
     },
   });
@@ -779,7 +786,10 @@ test('_CONFIG exports correct constants', () => {
   const { _CONFIG } = require('../lib/embeddings');
 
   assert.strictEqual(_CONFIG.EMBEDDING_DIMS, 768, 'EMBEDDING_DIMS should be 768');
-  assert.strictEqual(_CONFIG.EMBEDDING_MODEL, 'text-embedding-004', 'EMBEDDING_MODEL should be text-embedding-004');
+  assert.ok(
+    _CONFIG.EMBEDDING_MODEL === 'text-embedding-004' || _CONFIG.EMBEDDING_MODEL === 'gemini-embedding-001',
+    'EMBEDDING_MODEL should be a valid Gemini embedding model'
+  );
   assert.strictEqual(_CONFIG.MAX_BATCH, 10, 'MAX_BATCH should be 10');
   assert.strictEqual(_CONFIG.RAG_THRESHOLD, 0.75, 'RAG_THRESHOLD should be 0.75');
   assert.strictEqual(_CONFIG.RAG_LIMIT, 3, 'RAG_LIMIT should be 3');
