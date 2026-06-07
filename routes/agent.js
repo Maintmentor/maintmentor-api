@@ -29,6 +29,7 @@ const { requireApiKey } = require('../middleware/auth');
 const { balanceCheck } = require('../middleware/balanceCheck');
 const { billing } = require('../middleware/billing');
 const { agentApiLimiter, photoLimiter } = require('../middleware/rateLimiter');
+const { buildRagContext, queueForEmbedding, processEmbeddingQueue } = require('../lib/embeddings');
 
 // ─── Gemini Client ─────────────────────────────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -158,6 +159,25 @@ router.post(
     }
 
     try {
+      // ─── RAG Lookup (< 200ms, skipped on timeout/error) ───────────────────
+      // Embed the question and find similar past answers to inject as context.
+      // buildRagContext enforces a 200ms timeout and returns null on any failure.
+      let ragContext = null;
+      try {
+        ragContext = await buildRagContext(question);
+      } catch (_ragErr) {
+        // Should not reach here (buildRagContext catches internally), but be safe
+        console.warn('[agent/query] RAG lookup threw unexpectedly — skipping:', _ragErr.message);
+      }
+
+      // Prepend RAG context to the question if we found relevant past answers
+      let promptText = fullQuestion;
+      if (ragContext) {
+        promptText = `${ragContext}
+
+${fullQuestion}`;
+      }
+
       // ─── Call Gemini ───────────────────────────────────────────────────────
       const model = genAI.getGenerativeModel({
         model: AGENT_MODEL,
@@ -165,7 +185,7 @@ router.post(
       });
 
       const geminiResponse = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: fullQuestion }] }],
+        contents: [{ role: 'user', parts: [{ text: promptText }] }],
         generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS },
       });
 
@@ -197,6 +217,7 @@ router.post(
           response_format: response_format || 'text',
           has_context: !!(context && typeof context === 'object'),
           question_length: question.length,
+          rag_injected: !!ragContext,
           // NO question text — could contain PII
         },
       };
@@ -224,6 +245,24 @@ router.post(
           .catch(err => {
             console.error('[agent/query] query_history insert error:', err.message);
           });
+      });
+
+      // ─── Queue for embedding (async, non-blocking) ────────────────────────
+      // Only queue high-confidence answers (threshold enforced inside queueForEmbedding)
+      setImmediate(() => {
+        queueForEmbedding(question, answer, {
+          source:    'agent_query',
+          confidence,
+          wallet_id: wallet.id || null,  // Stored as-is; not publicly exposed
+          category:  'maintenance',
+        }).catch(err => {
+          console.error('[agent/query] queueForEmbedding error:', err.message);
+        });
+
+        // Kick the embedding worker to process any pending items
+        processEmbeddingQueue().catch(err => {
+          console.error('[agent/query] processEmbeddingQueue error:', err.message);
+        });
       });
 
       // ─── Send response ─────────────────────────────────────────────────────
