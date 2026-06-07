@@ -9,7 +9,7 @@
  *
  * Endpoints:
  *   POST /api/webhooks/stripe  — Stripe credit pack checkout events
- *   POST /api/webhooks/solana  — Helius SOL deposit notifications
+ *   POST /api/webhooks/solana  — Helius SOL + USDC deposit notifications
  *
  * Security:
  *   Stripe:  Raw body required for signature verification (STRIPE_WEBHOOK_SECRET)
@@ -17,7 +17,7 @@
  *
  * Idempotency:
  *   Stripe:  Deduplicated by stripe_payment_intent_id in wallet_transactions
- *   Solana:  Deduplicated by Solana transaction signature in wallet_transactions
+ *   Solana:  Deduplicated by external_id (sol:<sig>:<from> or usdc:<sig>:<from>) in wallet_transactions
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
@@ -341,20 +341,26 @@ async function sendPaymentFailureEmail(userId, paymentIntentId) {
   console.log(`[webhook] ✉️  Payment failure email sent to ${userEmail}`);
 }
 
+// ─── Constants ─────────────────────────────────────────────────────────────────
+
+/** USDC SPL token mint address on Solana mainnet */
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
 // ─── POST /solana ───────────────────────────────────────────────────────────────
 /**
- * Helius SOL deposit webhook endpoint.
+ * Helius SOL + USDC deposit webhook endpoint.
  *
  * Helius delivers a JSON array of enhanced transaction objects whenever
- * a configured address receives a SOL transfer.  We:
+ * a configured address receives a SOL or USDC transfer.  We:
  *   1. Verify the Helius Authorization header secret
  *   2. Parse the raw body (registered before express.json() in server.js)
- *   3. For each native SOL transfer targeting the MaintMentor wallet address:
- *      a. Check idempotency (transaction signature in wallet_transactions)
- *      b. Get current SOL/USD price from CoinGecko
- *      c. Look up the depositing wallet by Solana address in our DB
- *      d. Call credit_wallet RPC with USD equivalent
- *      e. Send confirmation email
+ *   3. For each native SOL or USDC token transfer targeting the MaintMentor wallet:
+ *      a. Check idempotency (external_id in wallet_transactions)
+ *      b. For SOL: get current SOL/USD price from CoinGecko
+ *      c. For USDC: amount is already in USD (1 USDC = $1.00)
+ *      d. Look up the depositing wallet by Solana address in our DB
+ *      e. Call credit_wallet RPC with USD equivalent
+ *      f. Send confirmation email specifying SOL or USDC
  *
  * Security:
  *   - HELIUS_WEBHOOK_SECRET env var compared against Authorization header
@@ -368,6 +374,10 @@ async function sendPaymentFailureEmail(userId, paymentIntentId) {
  * SOL → Credits conversion:
  *   - 1 SOL = N USD (real-time CoinGecko)
  *   - 1 USD = 1 credit (matches existing balance_usd as credits convention)
+ *
+ * USDC → Credits conversion:
+ *   - 1 USDC = $1.00 USD (no price lookup needed)
+ *   - tokenAmount from Helius is human-readable (e.g. 10.5 = $10.50)
  */
 router.post('/solana', async (req, res) => {
   const heliusSecret = process.env.HELIUS_WEBHOOK_SECRET;
@@ -463,16 +473,18 @@ async function getSolUsdPrice() {
   return price;
 }
 
+
 // ─── processSolanaDeposit ────────────────────────────────────────────────────────
 
 /**
  * Process a single Helius enhanced transaction object.
  *
- * Helius nativeTransfers format:
- *   [
- *     { fromUserAccount: "...", toUserAccount: "...", amount: <lamports> },
- *     ...
- *   ]
+ * Helius nativeTransfers format (SOL):
+ *   [{ fromUserAccount, toUserAccount, amount }]  — amount in lamports
+ *
+ * Helius tokenTransfers format (SPL):
+ *   [{ fromUserAccount, toUserAccount, mint, tokenAmount, tokenStandard }]
+ *   — tokenAmount is human-readable (e.g. 10.5 USDC = 10.5, not 10_500_000)
  *
  * @param {object} tx - Helius enhanced transaction
  */
@@ -484,116 +496,189 @@ async function processSolanaDeposit(tx) {
   }
 
   const maintmentorWallet = process.env.MAINTMENTOR_SOLANA_WALLET;
+
+  // ─── Process native SOL transfers ────────────────────────────────────────────
   const nativeTransfers = tx.nativeTransfers || [];
 
-  // Filter transfers going TO the MaintMentor wallet
   const inbound = maintmentorWallet
     ? nativeTransfers.filter(t => t.toUserAccount === maintmentorWallet && t.amount > 0)
     : nativeTransfers.filter(t => t.amount > 0);
-
-  if (inbound.length === 0) {
-    console.log(`[solana-webhook] No inbound SOL transfers in tx ${txSignature} — skipping`);
-    return;
-  }
 
   for (const transfer of inbound) {
     const lamports = transfer.amount;
     const fromAddress = transfer.fromUserAccount;
     const solAmount = lamports / 1_000_000_000; // lamports → SOL
 
-    console.log(`[solana-webhook] Inbound transfer: ${solAmount} SOL from ${fromAddress}, tx: ${txSignature}`);
+    console.log(`[solana-webhook] Inbound SOL transfer: ${solAmount} SOL from ${fromAddress}, tx: ${txSignature}`);
 
-    // ─── IDEMPOTENCY CHECK ────────────────────────────────────────────
-    // Use transaction signature + from address as compound idempotency key
-    const externalId = `sol:${txSignature}:${fromAddress}`;
-
-    const { data: existing } = await supabase
-      .from('wallet_transactions')
-      .select('id')
-      .eq('external_id', externalId)
-      .maybeSingle();
-
-    if (existing) {
-      console.log(`[solana-webhook] Already processed ${externalId} — skipping (idempotency)`);
-      continue;
-    }
-
-    // ─── Resolve USD value ─────────────────────────────────────────────
-    let solUsdPrice;
-    try {
-      solUsdPrice = await getSolUsdPrice();
-    } catch (priceErr) {
-      console.error(`[solana-webhook] ❌ Could not get SOL price: ${priceErr.message}`);
-      // Don’t credit if we can’t determine USD value — log for manual review
-      continue;
-    }
-
-    const usdValue = parseFloat((solAmount * solUsdPrice).toFixed(2));
-    if (usdValue <= 0) {
-      console.warn(`[solana-webhook] Computed USD value is ${usdValue} — skipping`);
-      continue;
-    }
-
-    // ─── Find user wallet by Solana address ──────────────────────────────
-    // Look up wallet by the fromAddress (depositor’s Solana public key)
-    const { data: userWallet, error: walletLookupError } = await supabase
-      .from('wallets')
-      .select('id, user_id')
-      .eq('solana_address', fromAddress)
-      .maybeSingle();
-
-    if (walletLookupError) {
-      console.error(`[solana-webhook] Wallet lookup error: ${walletLookupError.message}`);
-    }
-
-    if (!userWallet) {
-      // Unknown sender — record in a holding table or log for manual review
-      console.warn(`[solana-webhook] No wallet found for Solana address ${fromAddress} — deposit of ${solAmount} SOL ($${usdValue}) not credited. Manual review required.`);
-      // Still record for audit trail
-      await supabase.from('wallet_transactions').insert({
-        wallet_id:   null,
-        amount_usd:  usdValue,
-        type:        'credit_pending',
-        description: `SOL deposit from unknown address ${fromAddress}: ${solAmount} SOL ($${usdValue} @ $${solUsdPrice}/SOL)`,
-        external_id: externalId,
-      }).then(({ error }) => {
-        if (error && !error.message?.includes('null value')) {
-          console.error('[solana-webhook] Failed to record unknown deposit:', error.message);
-        }
-      });
-      continue;
-    }
-
-    // ─── Credit the wallet ─────────────────────────────────────────────
-    const description = `SOL deposit: ${solAmount} SOL @ $${solUsdPrice}/SOL = $${usdValue} USD`;
-
-    const { error: rpcError } = await supabase.rpc('credit_wallet', {
-      p_wallet_id:             userWallet.id,
-      p_credits:               usdValue,
-      p_description:           description,
-      p_stripe_payment_intent: externalId, // repurposed as generic external_id
+    await _processSingleDeposit({
+      txSignature,
+      fromAddress,
+      tokenType: 'SOL',
+      getSolAmount: async () => {
+        const solUsdPrice = await getSolUsdPrice();
+        const usdValue = parseFloat((solAmount * solUsdPrice).toFixed(2));
+        return { usdValue, solAmount, solUsdPrice };
+      },
+      buildDescription: ({ usdValue, solAmount, solUsdPrice }) =>
+        `SOL deposit: ${solAmount} SOL @ $${solUsdPrice}/SOL = $${usdValue} USD`,
+      sendEmail: (userId, { usdValue, solAmount, solUsdPrice }) =>
+        sendSolanaDepositEmail(userId, solAmount, usdValue, solUsdPrice, txSignature),
     });
+  }
 
-    if (rpcError) {
-      console.error(`[solana-webhook] ❌ credit_wallet RPC failed: ${rpcError.message}`);
-      throw new Error(`credit_wallet failed: ${rpcError.message}`);
-    }
+  // ─── Process USDC token transfers ─────────────────────────────────────────────
+  const tokenTransfers = tx.tokenTransfers || [];
 
-    console.log(`[solana-webhook] ✅ Credited $${usdValue} (${solAmount} SOL) to wallet ${userWallet.id}`);
+  // Filter USDC transfers going TO the MaintMentor wallet
+  const inboundUsdc = maintmentorWallet
+    ? tokenTransfers.filter(t => t.toUserAccount === maintmentorWallet && t.mint === USDC_MINT && t.tokenAmount > 0)
+    : tokenTransfers.filter(t => t.mint === USDC_MINT && t.tokenAmount > 0);
 
-    // ─── Send confirmation email ─────────────────────────────────────────
-    if (userWallet.user_id) {
-      try {
-        await sendSolanaDepositEmail(userWallet.user_id, solAmount, usdValue, solUsdPrice, txSignature);
-      } catch (emailErr) {
-        // Non-fatal — credits already applied
-        console.error('[solana-webhook] ⚠️  Deposit email failed (non-fatal):', emailErr.message);
+  // Log and ignore non-USDC token transfers
+  const unknownTokens = tokenTransfers.filter(
+    t => t.mint !== USDC_MINT &&
+    (!maintmentorWallet || t.toUserAccount === maintmentorWallet) &&
+    t.tokenAmount > 0
+  );
+  if (unknownTokens.length > 0) {
+    const mints = [...new Set(unknownTokens.map(t => t.mint))].join(', ');
+    console.log(`[solana-webhook] Ignoring unknown token transfer(s) in tx ${txSignature}: mints=${mints}`);
+  }
+
+  for (const transfer of inboundUsdc) {
+    const fromAddress = transfer.fromUserAccount;
+    // tokenAmount from Helius Enhanced API is human-readable (10.5 USDC = $10.50)
+    const usdcAmount = transfer.tokenAmount;
+
+    console.log(`[solana-webhook] Inbound USDC transfer: ${usdcAmount} USDC from ${fromAddress}, tx: ${txSignature}`);
+
+    await _processSingleDeposit({
+      txSignature,
+      fromAddress,
+      tokenType: 'USDC',
+      getSolAmount: async () => {
+        // 1 USDC = $1.00 — no price lookup needed
+        const usdValue = parseFloat(usdcAmount.toFixed(2));
+        return { usdValue, usdcAmount };
+      },
+      buildDescription: ({ usdValue, usdcAmount }) =>
+        `USDC deposit: ${usdcAmount} USDC = $${usdValue} USD`,
+      sendEmail: (userId, { usdValue, usdcAmount }) =>
+        sendUsdcDepositEmail(userId, usdcAmount, usdValue, txSignature),
+    });
+  }
+
+  if (inbound.length === 0 && inboundUsdc.length === 0) {
+    console.log(`[solana-webhook] No inbound SOL or USDC transfers in tx ${txSignature} — skipping`);
+  }
+}
+
+// ─── _processSingleDeposit (shared logic for SOL + USDC) ───────────────────────
+
+/**
+ * Shared deposit processing logic for SOL and USDC.
+ * Handles idempotency check, USD resolution, wallet lookup, credit, and email.
+ *
+ * @param {object}   opts
+ * @param {string}   opts.txSignature      - Solana transaction signature
+ * @param {string}   opts.fromAddress      - Depositor's Solana public key
+ * @param {string}   opts.tokenType        - 'SOL' or 'USDC'
+ * @param {Function} opts.getSolAmount     - async () => { usdValue, ...extra }
+ * @param {Function} opts.buildDescription - (amounts) => string
+ * @param {Function} opts.sendEmail        - async (userId, amounts) => void
+ */
+async function _processSingleDeposit({ txSignature, fromAddress, tokenType, getSolAmount, buildDescription, sendEmail }) {
+  // Idempotency key: token-type-prefixed to prevent sol/usdc collision on same tx
+  const prefix = tokenType.toLowerCase(); // 'sol' or 'usdc'
+  const externalId = `${prefix}:${txSignature}:${fromAddress}`;
+
+  // ─── IDEMPOTENCY CHECK ────────────────────────────────────────────────────────
+  const { data: existing } = await supabase
+    .from('wallet_transactions')
+    .select('id')
+    .eq('external_id', externalId)
+    .maybeSingle();
+
+  if (existing) {
+    console.log(`[solana-webhook] Already processed ${externalId} — skipping (idempotency)`);
+    return;
+  }
+
+  // ─── Resolve USD value ────────────────────────────────────────────────────────
+  let amounts;
+  try {
+    amounts = await getSolAmount();
+  } catch (priceErr) {
+    console.error(`[solana-webhook] ❌ Could not compute USD value for ${tokenType}: ${priceErr.message}`);
+    return; // don't credit if we can't determine USD value
+  }
+
+  const { usdValue } = amounts;
+  if (!usdValue || usdValue <= 0) {
+    console.warn(`[solana-webhook] Computed USD value is ${usdValue} — skipping`);
+    return;
+  }
+
+  // ─── Find user wallet by Solana address ──────────────────────────────────────
+  const { data: userWallet, error: walletLookupError } = await supabase
+    .from('wallets')
+    .select('id, user_id')
+    .eq('solana_address', fromAddress)
+    .maybeSingle();
+
+  if (walletLookupError) {
+    console.error(`[solana-webhook] Wallet lookup error: ${walletLookupError.message}`);
+  }
+
+  if (!userWallet) {
+    const depositLabel = buildDescription(amounts);
+    console.warn(`[solana-webhook] No wallet found for Solana address ${fromAddress} — ${depositLabel} not credited. Manual review required.`);
+    // Record for audit trail
+    await supabase.from('wallet_transactions').insert({
+      wallet_id:   null,
+      amount_usd:  usdValue,
+      token_mint:  tokenType === 'USDC' ? USDC_MINT : null,
+      type:        'credit_pending',
+      description: `${tokenType} deposit from unknown address ${fromAddress}: ${depositLabel}`,
+      external_id: externalId,
+    }).then(({ error }) => {
+      if (error && !error.message?.includes('null value')) {
+        console.error('[solana-webhook] Failed to record unknown deposit:', error.message);
       }
+    });
+    return;
+  }
+
+  // ─── Credit the wallet ────────────────────────────────────────────────────────
+  const description = buildDescription(amounts);
+
+  const { error: rpcError } = await supabase.rpc('credit_wallet', {
+    p_wallet_id:             userWallet.id,
+    p_credits:               usdValue,
+    p_description:           description,
+    p_stripe_payment_intent: externalId, // repurposed as generic external_id
+  });
+
+  if (rpcError) {
+    console.error(`[solana-webhook] ❌ credit_wallet RPC failed: ${rpcError.message}`);
+    throw new Error(`credit_wallet failed: ${rpcError.message}`);
+  }
+
+  console.log(`[solana-webhook] ✅ Credited $${usdValue} (${tokenType}) to wallet ${userWallet.id}`);
+
+  // ─── Send confirmation email ──────────────────────────────────────────────────
+  if (userWallet.user_id) {
+    try {
+      await sendEmail(userWallet.user_id, amounts);
+    } catch (emailErr) {
+      // Non-fatal — credits already applied
+      console.error('[solana-webhook] ⚠️  Deposit email failed (non-fatal):', emailErr.message);
     }
   }
 }
 
-// ─── Email: Solana Deposit Confirmation ─────────────────────────────────────────
+// ─── Email: SOL Deposit Confirmation ────────────────────────────────────────────
 
 /**
  * Send a SOL deposit confirmation email via Resend.
@@ -674,7 +759,89 @@ async function sendSolanaDepositEmail(userId, solAmount, usdValue, solUsdPrice, 
 </html>`,
   });
 
-  console.log(`[solana-webhook] ✉️  Deposit confirmation email sent to ${userEmail} (${solAmount} SOL = $${usdValue})`);
+  console.log(`[solana-webhook] ✉️  SOL deposit email sent to ${userEmail} (${solAmount} SOL = $${usdValue})`);
+}
+
+// ─── Email: USDC Deposit Confirmation ────────────────────────────────────────────
+
+/**
+ * Send a USDC deposit confirmation email via Resend.
+ *
+ * @param {string} userId       - Supabase user UUID
+ * @param {number} usdcAmount   - Amount of USDC deposited
+ * @param {number} usdValue     - USD value (same as usdcAmount for USDC)
+ * @param {string} txSignature  - Solana transaction signature
+ */
+async function sendUsdcDepositEmail(userId, usdcAmount, usdValue, txSignature) {
+  const RESEND_API_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_API_KEY) {
+    console.warn('[solana-webhook] RESEND_API_KEY not set — skipping USDC deposit email');
+    return;
+  }
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('email, full_name')
+    .eq('id', userId)
+    .maybeSingle();
+
+  const userEmail = profile?.email;
+  if (!userEmail) {
+    console.warn(`[solana-webhook] No email for user ${userId} — skipping USDC deposit email`);
+    return;
+  }
+
+  const userName = profile?.full_name || 'there';
+  const solanaExplorerUrl = `https://solscan.io/tx/${txSignature}`;
+
+  const { Resend } = require('resend');
+  const resend = new Resend(RESEND_API_KEY);
+
+  await resend.emails.send({
+    from: 'MaintMentor <support@maintmentor.ai>',
+    to: [userEmail],
+    subject: `✅ USDC deposit received — $${usdValue.toFixed(2)} added to your wallet`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:560px;margin:40px auto;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);overflow:hidden">
+    <div style="background:#1e293b;padding:28px 32px;text-align:center">
+      <h1 style="color:#f59e0b;font-size:22px;margin:0;font-weight:700">MaintMentor</h1>
+    </div>
+    <div style="padding:32px">
+      <h2 style="color:#1e293b;font-size:20px;margin:0 0 16px">USDC Deposit Received! 💵</h2>
+      <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 8px">Hi ${userName},</p>
+      <p style="color:#475569;font-size:15px;line-height:1.6;margin:0 0 24px">
+        Your USDC deposit has been received and credited to your account.
+      </p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:0 0 16px">
+        <table style="width:100%;border-collapse:collapse">
+          <tr><td style="color:#475569;font-size:14px;padding:4px 0">USDC deposited</td><td style="color:#166534;font-size:14px;font-weight:600;text-align:right">${usdcAmount.toFixed(2)} USDC</td></tr>
+          <tr style="border-top:1px solid #bbf7d0">
+            <td style="color:#1e293b;font-size:15px;font-weight:700;padding:8px 0 4px">Credits added</td>
+            <td style="color:#166534;font-size:18px;font-weight:700;text-align:right">+$${usdValue.toFixed(2)}</td>
+          </tr>
+        </table>
+      </div>
+      <p style="color:#64748b;font-size:13px;margin:0 0 24px">
+        Transaction: <a href="${solanaExplorerUrl}" style="color:#2563eb">${txSignature.slice(0, 20)}...</a>
+      </p>
+      <div style="text-align:center;margin:0 0 24px">
+        <a href="https://maintmentor.ai/dashboard" style="display:inline-block;background:#f59e0b;color:#1e293b;text-decoration:none;font-weight:700;font-size:15px;padding:14px 32px;border-radius:8px">Go to Dashboard →</a>
+      </div>
+      <p style="color:#94a3b8;font-size:12px;margin:0">Questions? Reply to this email — we're here to help.</p>
+    </div>
+    <div style="background:#f8fafc;padding:16px 32px;text-align:center;border-top:1px solid #e2e8f0">
+      <p style="color:#94a3b8;font-size:12px;margin:0">© 2026 MaintMentor.ai — All rights reserved</p>
+    </div>
+  </div>
+</body>
+</html>`,
+  });
+
+  console.log(`[solana-webhook] ✉️  USDC deposit email sent to ${userEmail} (${usdcAmount} USDC = $${usdValue})`);
 }
 
 // ─── Export the price cache resetter (for tests) ──────────────────────────────
@@ -686,3 +853,4 @@ module.exports = router;
 module.exports._resetSolPriceCache = _resetSolPriceCache;
 module.exports.getSolUsdPrice = getSolUsdPrice;
 module.exports.processSolanaDeposit = processSolanaDeposit;
+module.exports.USDC_MINT = USDC_MINT;

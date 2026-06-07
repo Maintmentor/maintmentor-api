@@ -430,4 +430,119 @@ router.post('/wallet/topup', async (req, res) => {
   }
 });
 
+// ─── POST /wallet/link-solana ─────────────────────────────────────────────────
+/**
+ * Link a Solana wallet address to the authenticated user's account.
+ * Deposits sent from this address will be automatically credited.
+ *
+ * Request body:
+ *   { "solana_address": "<base58-encoded-solana-public-key>" }
+ *
+ * Response:
+ *   200 { success: true, solana_address: "..." }
+ *   400 if solana_address is missing or invalid format
+ *   500 on DB error
+ *
+ * Validation:
+ *   - 32–44 characters
+ *   - Base58 alphabet: 1-9, A-H, J-N, P-Z, a-k, m-z (no 0, O, I, l)
+ */
+const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+router.post('/wallet/link-solana', async (req, res) => {
+  const userId = req.user.id;
+  const { solana_address } = req.body || {};
+
+  if (!solana_address) {
+    return res.status(400).json({
+      error: 'solana_address is required',
+      code: 'MISSING_SOLANA_ADDRESS',
+    });
+  }
+
+  if (typeof solana_address !== 'string' || !BASE58_RE.test(solana_address)) {
+    return res.status(400).json({
+      error: 'Invalid Solana address — must be 32–44 base58 characters',
+      code: 'INVALID_SOLANA_ADDRESS',
+    });
+  }
+
+  try {
+    // Ensure wallet exists first
+    const wallet = await getOrCreateWallet(userId);
+
+    const { error: updateError } = await supabase
+      .from('wallets')
+      .update({ solana_address: solana_address })
+      .eq('id', wallet.id);
+
+    if (updateError) {
+      // UNIQUE constraint violation means another account already linked this address
+      if (updateError.code === '23505') {
+        return res.status(409).json({
+          error: 'This Solana address is already linked to another account',
+          code: 'SOLANA_ADDRESS_TAKEN',
+        });
+      }
+      console.error('Failed to link Solana address:', updateError.message);
+      return res.status(500).json({
+        error: 'Failed to link Solana address',
+        code: 'LINK_FAILED',
+      });
+    }
+
+    console.log(`[dashboard] User ${userId} linked Solana address: ${solana_address}`);
+    return res.status(200).json({ success: true, solana_address });
+  } catch (err) {
+    console.error('POST /dashboard/wallet/link-solana error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+// ─── GET /wallet/solana-address ────────────────────────────────────────────────
+/**
+ * Get the Solana wallet address linked to the authenticated user's account.
+ *
+ * Response:
+ *   200 { solana_address: "<address>" | null }
+ *   404 if no wallet exists yet
+ */
+router.get('/wallet/solana-address', async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const { data: wallet, error: walletError } = await supabase
+      .from('wallets')
+      .select('solana_address')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (walletError) {
+      console.error('Failed to fetch wallet for solana-address:', walletError.message);
+      return res.status(500).json({
+        error: 'Failed to retrieve wallet',
+        code: 'WALLET_FETCH_FAILED',
+      });
+    }
+
+    if (!wallet) {
+      return res.status(404).json({
+        error: 'Wallet not found',
+        code: 'WALLET_NOT_FOUND',
+      });
+    }
+
+    return res.status(200).json({ solana_address: wallet.solana_address || null });
+  } catch (err) {
+    console.error('GET /dashboard/wallet/solana-address error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
 module.exports = router;
