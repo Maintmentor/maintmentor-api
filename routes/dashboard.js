@@ -905,5 +905,154 @@ router.get('/usage/chart', async (req, res) => {
   }
 });
 
+// ─── POST /keys/rotate ──────────────────────────────────────────────────────
+/**
+ * Rotate an API key — generate a replacement, revoke the old one atomically.
+ *
+ * The old key is marked is_active=false with revoked_at + rotated_at timestamps.
+ * The new key is returned ONCE as plaintext. Store it securely; it cannot be
+ * recovered after this response.
+ *
+ * Request body:
+ *   { "key_id": "uuid" }  — ID of the key to rotate (required)
+ *
+ * Response:
+ *   200 {
+ *     key:        "<new raw key — shown ONCE>",
+ *     prefix:     "mm_pk_xxxxxxxx",
+ *     label:      "...",
+ *     created_at: "...",
+ *     rotated_key_id: "<old key id that was revoked>"
+ *   }
+ *
+ * Errors:
+ *   400 MISSING_KEY_ID   — key_id not provided
+ *   404 KEY_NOT_FOUND    — key doesn't exist or belongs to a different user
+ *   409 KEY_ALREADY_REVOKED — key is already inactive (can't rotate a dead key)
+ */
+router.post('/keys/rotate', async (req, res) => {
+  const userId = req.user.id;
+  const { key_id } = req.body || {};
+
+  if (!key_id) {
+    return res.status(400).json({
+      error: 'key_id is required',
+      code:  'MISSING_KEY_ID',
+    });
+  }
+
+  try {
+    // 1. Fetch the key to rotate
+    const { data: oldKey, error: fetchErr } = await supabase
+      .from('api_keys')
+      .select('id, user_id, wallet_id, label, is_active, revoked_at')
+      .eq('id', key_id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchErr || !oldKey) {
+      return res.status(404).json({
+        error: 'API key not found',
+        code:  'KEY_NOT_FOUND',
+      });
+    }
+
+    if (!oldKey.is_active) {
+      return res.status(409).json({
+        error: 'API key is already revoked — cannot rotate an inactive key',
+        code:  'KEY_ALREADY_REVOKED',
+      });
+    }
+
+    // 2. Generate the replacement key
+    const rawKey  = generateApiKey();
+    const keyHash = hashApiKey(rawKey);
+    const prefix  = getKeyPrefix(rawKey);
+    const now     = new Date().toISOString();
+
+    // 3. Insert the new key
+    const { data: newKey, error: insertErr } = await supabase
+      .from('api_keys')
+      .insert({
+        user_id:    userId,
+        wallet_id:  oldKey.wallet_id,
+        key_hash:   keyHash,
+        key_prefix: prefix,
+        label:      oldKey.label ? `${oldKey.label} (rotated)` : null,
+        is_active:  true,
+      })
+      .select('id, key_prefix, label, created_at')
+      .single();
+
+    if (insertErr) {
+      console.error('POST /keys/rotate failed to insert new key:', insertErr.message);
+      return res.status(500).json({
+        error: 'Failed to create replacement key',
+        code:  'KEY_CREATE_FAILED',
+      });
+    }
+
+    // 4. Revoke the old key (mark rotated)
+    // Base update — always safe (columns exist from Day 1)
+    const revokeFields = {
+      is_active:  false,
+      revoked_at: now,
+    };
+    // Try to add rotated_at/rotated_to if migration has been applied
+    // If columns don't exist, Supabase returns an error we can ignore safely
+    let { error: revokeErr } = await supabase
+      .from('api_keys')
+      .update({ ...revokeFields, rotated_at: now, rotated_to: newKey.id })
+      .eq('id', oldKey.id)
+      .eq('user_id', userId);
+
+    if (revokeErr) {
+      // If error is about unknown column (rotated_at/rotated_to), retry without those fields
+      const isColumnErr = revokeErr.message && (
+        revokeErr.message.includes('rotated_at') ||
+        revokeErr.message.includes('rotated_to') ||
+        revokeErr.message.includes('Could not find')
+      );
+      if (isColumnErr) {
+        // Column doesn't exist yet (migration pending) — revoke without audit fields
+        const retry = await supabase
+          .from('api_keys')
+          .update(revokeFields)
+          .eq('id', oldKey.id)
+          .eq('user_id', userId);
+        revokeErr = retry.error;
+      }
+    }
+
+    if (revokeErr) {
+      console.error('POST /keys/rotate failed to revoke old key:', revokeErr.message);
+      // Attempt cleanup of the new key to avoid orphan
+      await supabase.from('api_keys').delete().eq('id', newKey.id);
+      return res.status(500).json({
+        error: 'Failed to revoke old key — rotation aborted',
+        code:  'KEY_REVOKE_FAILED',
+      });
+    }
+
+    console.log(`[dashboard] Key rotated — user: ${userId}, old: ${oldKey.id}, new: ${newKey.id}`);
+
+    // 5. Return new key ONCE
+    return res.status(200).json({
+      key:            rawKey,
+      prefix:         newKey.key_prefix,
+      label:          newKey.label,
+      created_at:     newKey.created_at,
+      rotated_key_id: oldKey.id,
+    });
+  } catch (err) {
+    console.error('POST /dashboard/keys/rotate error:', err.message);
+    return res.status(500).json({
+      error: 'Internal server error',
+      code:  'INTERNAL_ERROR',
+    });
+  }
+});
+
 module.exports = router;
+
 

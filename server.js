@@ -1,5 +1,7 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
+const logger  = require('./lib/logger');
+const requestLogger = require('./middleware/requestLogger');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { v4: uuidv4 } = require('uuid');
@@ -214,18 +216,103 @@ const stripeWebhookRouter = require('./routes/webhooks');
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), stripeWebhookRouter);
 
 app.use(express.json({ limit: '10mb' }));
+app.use(requestLogger);
 
-// Health check
-app.get('/api/health', (req, res) => {
+// ─── Enhanced Health Check ────────────────────────────────────────────────────
+app.get('/api/health', async (req, res) => {
   const spend = getSpendSummary();
-  res.json({
-    status: 'ok',
-    service: 'maintmentor-api',
-    models: { pro: MODEL_PRO, flash: MODEL_FLASH },
-    routing: 'two-tier (flash for simple, pro for complex/photos/safety)',
-    engine: 'gemini',
-    timestamp: new Date().toISOString(),
-    dailySpend: spend.today.totalCost?.toFixed(2) || '0.00',
+  const checks = {};
+
+  // ── 1. DB (Supabase) ping ──────────────────────────────────────────
+  try {
+    const supabase = require('./lib/supabase');
+    const t0 = Date.now();
+    const { error } = await Promise.race([
+      supabase.from('wallets').select('id').limit(1),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
+    ]);
+    checks.db = error
+      ? { status: 'degraded', error: error.message, latency_ms: Date.now() - t0 }
+      : { status: 'ok', latency_ms: Date.now() - t0 };
+  } catch (e) {
+    checks.db = { status: 'down', error: e.message };
+  }
+
+  // ── 2. Stripe API reachability ─────────────────────────────────
+  try {
+    const stripeLib = require('./lib/stripe');
+    const t0 = Date.now();
+    await Promise.race([
+      stripeLib.stripe.balance.retrieve(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+    ]);
+    checks.stripe = { status: 'ok', latency_ms: Date.now() - t0 };
+  } catch (e) {
+    const isTimeout = e.message === 'timeout';
+    checks.stripe = {
+      status: isTimeout ? 'degraded' : 'down',
+      error:  isTimeout ? 'Request timed out' : 'API unreachable',
+    };
+  }
+
+  // ── 3. Helius / Solana RPC reachability ───────────────────────
+  try {
+    const heliusUrl = process.env.HELIUS_RPC_URL;
+    if (!heliusUrl) throw new Error('HELIUS_RPC_URL not set');
+    const https = require('https');
+    const t0 = Date.now();
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        const body = JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'getHealth', params: [],
+        });
+        const url = new URL(heliusUrl);
+        const opts = {
+          hostname: url.hostname,
+          path:     url.pathname + url.search,
+          method:   'POST',
+          headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout:  3000,
+        };
+        const req2 = https.request(opts, (resp) => {
+          let data = '';
+          resp.on('data', (c) => data += c);
+          resp.on('end', () => {
+            try { resolve(JSON.parse(data)); } catch { resolve({ result: 'ok' }); }
+          });
+        });
+        req2.on('error', reject);
+        req2.on('timeout', () => { req2.destroy(); reject(new Error('timeout')); });
+        req2.write(body);
+        req2.end();
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+    ]);
+    checks.helius = { status: 'ok', latency_ms: Date.now() - t0 };
+  } catch (e) {
+    checks.helius = {
+      status: e.message === 'timeout' ? 'degraded' : 'down',
+      error:  e.message,
+    };
+  }
+
+  // ── Overall status ──────────────────────────────────────────────
+  const statuses = Object.values(checks).map((c) => c.status);
+  const overall  = statuses.every((s) => s === 'ok')        ? 'ok'
+                 : statuses.some((s)  => s === 'down')       ? 'down'
+                 : 'degraded';
+
+  const httpStatus = overall === 'down' ? 503 : 200;
+
+  return res.status(httpStatus).json({
+    status:        overall,
+    service:       'maintmentor-api',
+    checks,
+    models:        { pro: MODEL_PRO, flash: MODEL_FLASH },
+    routing:       'two-tier (flash for simple, pro for complex/photos/safety)',
+    engine:        'gemini',
+    timestamp:     new Date().toISOString(),
+    dailySpend:    spend.today.totalCost?.toFixed(2) || '0.00',
     dailyRequests: spend.today.requestCount || 0,
   });
 });
@@ -774,6 +861,7 @@ registerBillingRoutes(app);
 // ─── Start Server ──────────────────────────────────────────────────────────────
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 app.listen(PORT, HOST, async () => {
+  logger.info({ port: PORT, env: process.env.NODE_ENV || 'development' }, 'MaintMentor API started');
   console.log(`🔧 MaintMentor API running on 127.0.0.1:${PORT}`);
   console.log(`   Model: ${MODEL}`);
   console.log(`   Health: http://127.0.0.1:${PORT}/api/health`);
@@ -781,6 +869,13 @@ app.listen(PORT, HOST, async () => {
   await ensureTable();
   await ensureQueryLogTable();
   await ensureStripeProduct();
+
+  // Start periodic anomaly scan (every 15 minutes)
+  if (process.env.NODE_ENV !== 'test') {
+    const { startAnomalyScan } = require('./lib/anomalyDetector');
+    startAnomalyScan();
+    console.log('   Anomaly scanner: ✅ started (15 min interval)');
+  }
 });
 
 // ─── Diagram Search Endpoint (Bing Image Search) ─────────────────────────────
