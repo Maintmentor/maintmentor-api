@@ -251,7 +251,7 @@ async function main() {
     // Try certification_lessons
     const { data: lessons, error: lessonsErr } = await supabase
       .from('certification_lessons')
-      .select('title, content')
+      .select('title, content_markdown')
       .limit(200);
 
     // Try certification_quiz_questions
@@ -265,11 +265,11 @@ async function main() {
     if (!lessonsErr && lessons && lessons.length > 0) {
       console.log(`   ✅ Found ${lessons.length} certification lessons`);
       for (const lesson of lessons) {
-        if (lesson.title && lesson.content) {
+        if (lesson.title && lesson.content_markdown) {
           dbItems.push({
             category: 'certification',
             question: lesson.title,
-            answer:   lesson.content,
+            answer:   lesson.content_markdown,
           });
         }
       }

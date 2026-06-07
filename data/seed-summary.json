@@ -1,9 +1,9 @@
 {
-  "run_at": "2026-06-07T19:05:16.961Z",
-  "source": "hardcoded_fallback",
+  "run_at": "2026-06-07T19:14:11.094Z",
+  "source": "database",
   "force_flag": true,
-  "total_items": 27,
-  "seeded": 27,
+  "total_items": 37,
+  "seeded": 37,
   "skipped": 0,
   "errors": 0,
   "error_log": []
