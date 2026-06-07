@@ -206,8 +206,12 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token', 'X-Device-Fingerprint']
 }));
 
-// ─── Stripe Webhook Route (MUST be before express.json()) ────────────────────
+// ─── Stripe Webhook Routes (MUST be before express.json()) ──────────────────
+// 1. Existing subscription billing webhook
 registerWebhookRoute(app);
+// 2. Credit pack checkout webhook (Day 4)
+const stripeWebhookRouter = require('./routes/webhooks');
+app.use('/api/webhooks', express.raw({ type: 'application/json' }), stripeWebhookRouter);
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -751,6 +755,21 @@ registerHeroRoutes(app);
 
 // ─── Stripe Billing Routes ─────────────────────────────────────────────────────
 registerBillingRoutes(app);
+
+// ─── Dashboard Routes (API Key Management + Wallet) ───────────────────────────
+{
+  const { requireJWT } = require('./middleware/auth');
+  const dashboardRouter = require('./routes/dashboard');
+  app.use('/api/dashboard', requireJWT, dashboardRouter);
+  console.log('   Routes: /api/dashboard registered ✅');
+}
+
+// ─── Agent API Routes (Developer/Agent Access) ────────────────────────────────
+{
+  const agentRouter = require('./routes/agent');
+  app.use('/api/agent', agentRouter);
+  console.log('   Routes: /api/agent registered ✅');
+}
 
 // ─── Start Server ──────────────────────────────────────────────────────────────
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
