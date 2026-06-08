@@ -518,7 +518,7 @@ app.get('/api/xprize/metrics', async (req, res) => {
       adminClient.from('query_history').select('account_id').gte('created_at', since7d),
       adminClient.from('wallet_transactions').select('amount').eq('type', 'credit'),
       adminClient.from('query_history').select('*', { count: 'exact', head: true }),
-      adminClient.from('certification_completions').select('*', { count: 'exact', head: true }),
+      adminClient.from('user_certifications').select('*', { count: 'exact', head: true }),
       adminClient.from('wallet_transactions').select('account_id').eq('type', 'credit').limit(10000),
     ]);
 

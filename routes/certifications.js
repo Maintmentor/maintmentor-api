@@ -590,9 +590,11 @@ function certNumber_generate() {
 router.get('/leaderboard', async (req, res) => {
   try {
     // Get top lesson completions aggregated by user
+    // user_lesson_progress uses completed=true boolean
     const { data, error } = await supabase
-      .from('lesson_completions')
+      .from('user_lesson_progress')
       .select('user_id')
+      .eq('completed', true)
       .limit(50000);
 
     if (error) throw error;
@@ -623,9 +625,9 @@ router.get('/leaderboard', async (req, res) => {
     const profileMap = {};
     (profiles || []).forEach(p => { profileMap[p.id] = p; });
 
-    // Get track completions count per user
+    // Get track completions count per user (from user_certifications)
     const { data: trackData } = await supabase
-      .from('certification_completions')
+      .from('user_certifications')
       .select('user_id')
       .in('user_id', userIds);
     const trackCountMap = {};
