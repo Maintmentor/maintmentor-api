@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS certification_lessons (
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ─── 3b. PATCH: add missing columns to existing certification_lessons table ──
+ALTER TABLE certification_lessons ADD COLUMN IF NOT EXISTS module_id UUID REFERENCES certification_modules(id) ON DELETE CASCADE;
+ALTER TABLE certification_lessons ADD COLUMN IF NOT EXISTS track_id UUID REFERENCES certification_tracks(id) ON DELETE CASCADE;
+ALTER TABLE certification_lessons ADD COLUMN IF NOT EXISTS content_markdown TEXT;
+ALTER TABLE certification_lessons ADD COLUMN IF NOT EXISTS order_index INT NOT NULL DEFAULT 0;
+ALTER TABLE certification_lessons ADD COLUMN IF NOT EXISTS estimated_minutes INT NOT NULL DEFAULT 15;
+
 -- ─── 4. CERTIFICATION QUIZZES ────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS certification_quizzes (

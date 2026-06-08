@@ -728,4 +728,169 @@ router.post(
   billing  // Post-response: deduct credits + log usage
 );
 
+// ─── POST /field — Field Companion Mode (Day 14) ─────────────────────────────────
+/**
+ * POST /api/agent/field
+ *
+ * Specialized endpoint for field technicians. Context-aware AI
+ * that understands urgency, location, and equipment type.
+ *
+ * Body: { question, location, equipment_type, urgency }
+ * urgency: 'low' | 'medium' | 'high' | 'emergency'
+ *
+ * Emergency: uses gemini-2.5-pro, no credit deduction (safety first)
+ * Others: routes to flash, 5 credits
+ */
+const FIELD_SYSTEM_PROMPT = `You are MaintMentor Field Companion — an AI assistant built for field technicians actively working on equipment. You are deployed on Google Cloud Run and powered by Gemini AI.
+
+Your responses must:
+1. Lead with any SAFETY WARNINGS (electrical, gas, pressure, height risks)
+2. Provide clear NEXT STEPS in numbered order
+3. Flag when a situation requires PROFESSIONAL ESCALATION
+4. Be concise — technicians are working, not reading essays
+5. Account for the equipment type, location, and urgency level provided
+
+Always output valid JSON with keys: answer, safety_warnings (array), next_steps (array), confidence (float 0-1), escalate_to_professional (bool).`;
+
+router.post(
+  '/field',
+  agentApiLimiter,
+  requireApiKey,
+  async (req, res) => {
+    const { question, location, equipment_type, urgency } = req.body || {};
+    const requestId = uuidv4();
+    const startTime = Date.now();
+
+    // ── Validate ─────────────────────────────────────────────────────────────
+    if (!question || typeof question !== 'string' || question.trim().length < 5) {
+      return res.status(400).json({
+        error: 'question is required (min 5 characters)',
+        code:  'INVALID_INPUT',
+      });
+    }
+    const VALID_URGENCY = ['low', 'medium', 'high', 'emergency'];
+    const urgencyLevel = VALID_URGENCY.includes(urgency) ? urgency : 'medium';
+
+    // ── Credit check (skip for emergency) ───────────────────────────────────
+    const { wallet } = req.apiContext || {};
+    const CREDIT_COST = 5;
+    const isEmergency = urgencyLevel === 'emergency';
+
+    if (!isEmergency) {
+      const balance = parseFloat(wallet?.balance_usd) || 0;
+      if (balance < CREDIT_COST * 0.01) {
+        return res.status(402).json({
+          error: 'Insufficient credits',
+          code:  'INSUFFICIENT_CREDITS',
+          balance_usd: balance,
+          required_credits: CREDIT_COST,
+        });
+      }
+    }
+
+    // ── Build prompt ────────────────────────────────────────────────────────
+    const contextPrefix = isEmergency ? 'EMERGENCY: ' : '';
+    const contextBlock = [
+      location      ? `Location: ${location}`         : null,
+      equipment_type ? `Equipment: ${equipment_type}` : null,
+      `Urgency: ${urgencyLevel.toUpperCase()}`,
+    ].filter(Boolean).join(' | ');
+
+    const fullPrompt = `${contextPrefix}${contextBlock}\n\nField Question: ${question.trim()}`;
+
+    // ── Select model ────────────────────────────────────────────────────────────
+    const selectedModel = isEmergency ? AGENT_MODEL_PRO : AGENT_MODEL;
+
+    try {
+      const modelClient = genAI.getGenerativeModel({
+        model: selectedModel,
+        systemInstruction: FIELD_SYSTEM_PROMPT,
+      });
+
+      const geminiResponse = await modelClient.generateContent({
+        contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+        generationConfig: {
+          maxOutputTokens: 1200,
+          responseMimeType: 'application/json',
+        },
+      });
+
+      const rawText = geminiResponse.response.text();
+      const usageMeta = geminiResponse.response?.usageMetadata;
+      const tokensInput  = usageMeta?.promptTokenCount     || 0;
+      const tokensOutput = usageMeta?.candidatesTokenCount || 0;
+      const latencyMs    = Date.now() - startTime;
+
+      // Parse JSON response from Gemini
+      let parsed;
+      try {
+        // Strip markdown code fences if present
+        const clean = rawText.replace(/^```json?\s*/i, '').replace(/```\s*$/i, '').trim();
+        parsed = JSON.parse(clean);
+      } catch {
+        // Fallback: treat entire response as answer
+        parsed = {
+          answer: rawText,
+          safety_warnings: [],
+          next_steps: [],
+          confidence: 0.7,
+          escalate_to_professional: urgencyLevel === 'emergency',
+        };
+      }
+
+      const { apiKey } = req.apiContext || {};
+
+      // Deduct credits for non-emergency
+      if (!isEmergency) {
+        await supabase.rpc('deduct_credits', {
+          p_user_id: apiKey?.user_id,
+          p_amount:  CREDIT_COST * 0.01, // credits in USD
+        }).catch(() => {}); // non-fatal
+      }
+
+      // Log to query_history (async)
+      setImmediate(() => {
+        supabase.from('query_history').insert({
+          account_id:    apiKey?.user_id,
+          question:      fullPrompt,
+          ai_answer:     parsed.answer || rawText,
+          model_used:    selectedModel,
+          tokens_input:  tokensInput,
+          tokens_output: tokensOutput,
+          latency_ms:    latencyMs,
+          source:        'agent_field',
+          context: {
+            location, equipment_type, urgency: urgencyLevel,
+            emergency: isEmergency,
+          },
+        }).then(({ error }) => {
+          if (error) console.error('[agent/field] history insert failed:', error.message);
+        }).catch(err => console.error('[agent/field] history insert error:', err.message));
+      });
+
+      return res.json({
+        request_id:              requestId,
+        answer:                  parsed.answer               || '',
+        safety_warnings:         Array.isArray(parsed.safety_warnings)  ? parsed.safety_warnings  : [],
+        next_steps:              Array.isArray(parsed.next_steps)        ? parsed.next_steps        : [],
+        confidence:              typeof parsed.confidence === 'number'    ? parseFloat(parsed.confidence.toFixed(2)) : 0.75,
+        escalate_to_professional: !!parsed.escalate_to_professional,
+        urgency:                 urgencyLevel,
+        emergency_mode:          isEmergency,
+        model_used:              selectedModel,
+        credits_used:            isEmergency ? 0 : CREDIT_COST,
+        response_time_ms:        latencyMs,
+      });
+
+    } catch (err) {
+      console.error('[agent/field] Gemini error:', err.message);
+      return res.status(500).json({
+        error: err.message || 'Field AI service error',
+        code:  'AI_SERVICE_ERROR',
+        request_id: requestId,
+      });
+    }
+  }
+);
+
 module.exports = router;

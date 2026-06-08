@@ -576,4 +576,94 @@ function certNumber_generate() {
   return `MM-${year}-${rand}`;
 }
 
+// ─── GET /leaderboard — Public (Day 14) ─────────────────────────────────────────────
+/**
+ * @swagger
+ * /api/certifications/leaderboard:
+ *   get:
+ *     summary: Top 10 learners by lessons completed
+ *     tags: [Certifications]
+ *     responses:
+ *       200:
+ *         description: Leaderboard array
+ */
+router.get('/leaderboard', async (req, res) => {
+  try {
+    // Get top lesson completions aggregated by user
+    const { data, error } = await supabase
+      .from('lesson_completions')
+      .select('user_id')
+      .limit(50000);
+
+    if (error) throw error;
+
+    // Count lessons per user
+    const countMap = {};
+    (data || []).forEach(r => {
+      countMap[r.user_id] = (countMap[r.user_id] || 0) + 1;
+    });
+
+    // Sort and take top 10
+    const top10 = Object.entries(countMap)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([userId, lessonCount]) => ({ userId, lessons_completed: lessonCount }));
+
+    if (top10.length === 0) {
+      return res.json({ success: true, leaderboard: [] });
+    }
+
+    // Fetch profile info for each user
+    const userIds = top10.map(u => u.userId);
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, full_name, email')
+      .in('id', userIds);
+
+    const profileMap = {};
+    (profiles || []).forEach(p => { profileMap[p.id] = p; });
+
+    // Get track completions count per user
+    const { data: trackData } = await supabase
+      .from('certification_completions')
+      .select('user_id')
+      .in('user_id', userIds);
+    const trackCountMap = {};
+    (trackData || []).forEach(r => {
+      trackCountMap[r.user_id] = (trackCountMap[r.user_id] || 0) + 1;
+    });
+
+    // Build leaderboard with display names
+    const leaderboard = top10.map((entry, idx) => {
+      const profile = profileMap[entry.userId];
+      let display_name = 'Anonymous';
+      if (profile?.full_name) {
+        const parts = profile.full_name.trim().split(' ');
+        const firstName = parts[0] || '';
+        const lastInitial = parts.length > 1 ? parts[parts.length - 1][0] + '.' : '';
+        display_name = lastInitial ? `${firstName} ${lastInitial}` : firstName;
+      } else if (profile?.email) {
+        // Use email prefix with last char masked
+        const prefix = profile.email.split('@')[0];
+        display_name = prefix.length > 2 ? prefix.slice(0, -1) + '*' : prefix;
+      }
+
+      return {
+        rank:             idx + 1,
+        display_name,
+        lessons_completed: entry.lessons_completed,
+        tracks_completed:  trackCountMap[entry.userId] || 0,
+      };
+    });
+
+    return res.json({
+      success: true,
+      leaderboard,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    return handleError(res, err, 'GET /leaderboard');
+  }
+});
+
 module.exports = router;
