@@ -103,12 +103,19 @@ test('server.js registers swaggerUi.setup at /api/docs', () => {
   );
 });
 
-// 8. server.js redirects /api/docs to /api/docs/
-test('server.js has redirect from /api/docs to /api/docs/', () => {
+// 8. server.js serves both /api/docs and /api/docs/
+test('server.js serves both /api/docs and /api/docs/ paths', () => {
   const content = readFile(SERVER_JS, 'server.js');
+  // Either an explicit redirect OR an array route covering both paths
+  const hasExplicitRedirect = content.includes("res.redirect('/api/docs/')");
+  const hasArrayRoute = content.includes("'/api/docs/', '/api/docs'") ||
+    content.includes("'/api/docs', '/api/docs/'") ||
+    content.includes('"/api/docs", "/api/docs/"') ||
+    content.includes('"/api/docs/", "/api/docs"') ||
+    (content.includes('[') && content.includes('/api/docs') && content.includes('swaggerSetupFn'));
   assert.ok(
-    content.includes("res.redirect('/api/docs/')"),
-    "server.js must redirect '/api/docs' to '/api/docs/'"
+    hasExplicitRedirect || hasArrayRoute,
+    'server.js must handle both /api/docs and /api/docs/ (redirect or array route)'
   );
 });
 

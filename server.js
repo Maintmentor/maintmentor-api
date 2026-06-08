@@ -851,12 +851,13 @@ registerBillingRoutes(app);
 {
   const openapiPath = path.join(__dirname, 'docs', 'openapi.yaml');
   const swaggerDocument = yaml.load(fs.readFileSync(openapiPath, 'utf8'));
-  // Redirect /api/docs → /api/docs/
-  app.get('/api/docs', (req, res) => res.redirect('/api/docs/'));
-  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument, {
+  // Serve Swagger UI at /api/docs — the setup handler serves HTML at both /api/docs and /api/docs/
+  const swaggerSetupFn = swaggerUi.setup(swaggerDocument, {
     customSiteTitle: 'MaintMentor API Docs',
-    customCss: '.swagger-ui .topbar { background-color: #1e293b; } .swagger-ui .topbar-wrapper img { content: url(https://maintmentor.ai/icons/maintmentor-logo.png); }',
-  }));
+    customCss: '.swagger-ui .topbar { background-color: #1e293b; }',
+  });
+  app.use('/api/docs', swaggerUi.serve);
+  app.get(['/api/docs', '/api/docs/'], swaggerSetupFn);
   console.log('   Routes: /api/docs (Swagger UI) registered ✅');
 }
 
