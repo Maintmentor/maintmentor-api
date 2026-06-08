@@ -326,6 +326,109 @@ app.get('/api/admin/spend', (req, res) => {
   res.json({ success: true, ...getSpendSummary() });
 });
 
+// ─── Admin Stats Endpoint (Day 12) ────────────────────────────────────────────
+// Requires X-Admin-Token header matching process.env.ADMIN_TOKEN
+app.get('/api/admin/stats', async (req, res) => {
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken || req.headers['x-admin-token'] !== adminToken) {
+    return res.status(401).json({ success: false, error: 'Unauthorized — valid X-Admin-Token required' });
+  }
+
+  try {
+    const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { createClient } = require('@supabase/supabase-js');
+    const adminClient = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    );
+
+    // 1. Total users
+    const { count: totalUsers } = await adminClient
+      .from('profiles')
+      .select('*', { count: 'exact', head: true });
+
+    // 2. Total revenue (sum of credit purchase amounts)
+    const { data: revData } = await adminClient
+      .from('wallet_transactions')
+      .select('amount')
+      .eq('type', 'credit');
+    const totalRevenue = (revData || []).reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+
+    // 3. Total queries
+    const { count: totalQueries } = await adminClient
+      .from('query_history')
+      .select('*', { count: 'exact', head: true });
+
+    // 4. Total photo analyses (endpoint contains 'photo')
+    const { count: totalPhotos } = await adminClient
+      .from('api_usage_logs')
+      .select('*', { count: 'exact', head: true })
+      .ilike('endpoint', '%photo%');
+
+    // 5. Active users last 7 days (from query_history)
+    const { data: activeData } = await adminClient
+      .from('query_history')
+      .select('account_id')
+      .gte('created_at', since7d);
+    const activeUsers = new Set((activeData || []).map(r => r.account_id)).size;
+
+    // 6. Top 5 users by query count
+    const { data: topData } = await adminClient
+      .from('query_history')
+      .select('account_id')
+      .limit(10000);
+    const countMap = {};
+    (topData || []).forEach(r => { countMap[r.account_id] = (countMap[r.account_id] || 0) + 1; });
+    const topUsers = Object.entries(countMap)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([userId, count]) => ({ userId, queryCount: count }));
+
+    return res.json({
+      success: true,
+      generatedAt: new Date().toISOString(),
+      stats: {
+        totalUsers:    totalUsers    || 0,
+        totalRevenue:  parseFloat(totalRevenue.toFixed(2)),
+        totalQueries:  totalQueries  || 0,
+        totalPhotos:   totalPhotos   || 0,
+        activeUsers7d: activeUsers,
+        topUsersByQueries: topUsers,
+      },
+    });
+  } catch (err) {
+    console.error('[admin/stats] Error:', err.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch stats' });
+  }
+});
+
+// ─── Public Status Page (Day 12) ──────────────────────────────────────────────
+const _serverStartTime = Date.now();
+app.get('/api/status', async (req, res) => {
+  const uptimeSeconds = Math.floor((Date.now() - _serverStartTime) / 1000);
+  let dbStatus = 'ok';
+  try {
+    const statusDb = require('./lib/supabase');
+    const { error } = await statusDb
+      .from('profiles')
+      .select('id')
+      .limit(1);
+    if (error) dbStatus = 'degraded';
+  } catch (_) {
+    dbStatus = 'down';
+  }
+  return res.json({
+    status:    dbStatus === 'ok' ? 'operational' : 'degraded',
+    uptime:    `${uptimeSeconds}s`,
+    version:   '1.0.0',
+    endpoints: {
+      api: 'ok',
+      db:  dbStatus,
+    },
+  });
+});
+
 // ─── Session Registration Endpoint ─────────────────────────────────────────────
 app.post('/api/session/register', async (req, res) => {
   const { userId, sessionToken, fingerprint } = req.body;
@@ -1226,7 +1329,7 @@ app.post('/api/auth/resend-verification', async (req, res) => {
 // ─── Auto-confirm email after signup (bypasses Supabase email verification) ───
 app.post('/api/auth/confirm-email', async (req, res) => {
   try {
-    const { userId } = req.body;
+    const { userId, email, name } = req.body;
     if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
 
     const { createClient } = require('@supabase/supabase-js');
@@ -1239,6 +1342,23 @@ app.post('/api/auth/confirm-email', async (req, res) => {
     if (error) throw new Error(error.message);
 
     console.log(`[auth] Email auto-confirmed for user ${userId}`);
+
+    // ─── Fire onboarding email sequence (Day 12) ───────────────────────────
+    if (email) {
+      setImmediate(async () => {
+        try {
+          const { sendOnboardingSequence } = require('./scripts/send-onboarding-email');
+          await sendOnboardingSequence({
+            id: userId,
+            email,
+            user_metadata: { full_name: name || '' },
+          });
+        } catch (emailErr) {
+          console.error('[auth] Onboarding email error (non-fatal):', emailErr.message);
+        }
+      });
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error('[auth] confirm-email error:', err.message);
