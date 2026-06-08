@@ -60,6 +60,31 @@ function rateLimitHandler(req, res, _next, options) {
   });
 }
 
+// ─── Rate Limit Review (Day 10 Go-Live) ──────────────────────────────────────
+//
+// VERDICT: Limits are appropriate for launch. Rationale:
+//
+//   agentApiLimiter — 100 req/min per API key
+//     • A sustained 100 req/min = 6,000/hour = ~144,000/day for ONE key.
+//     • At 5 credits each → max 720,000 credits/day/key.
+//     • In practice, agents will use far less — this limit protects runaway loops.
+//     • Competitors (OpenAI, Anthropic) allow 60–500 RPM on their lowest tiers.
+//     • 100/min is generous enough for production use, tight enough to cap abuse.
+//
+//   photoLimiter — 10 req/min per API key
+//     • Photos cost 3× more (15 credits) and hit Gemini Vision which is expensive.
+//     • 10/min = 600/hour = sufficient for any real-world automation use case.
+//     • Protects against accidental tight loops that could drain wallet rapidly.
+//     • Can be relaxed for enterprise tier later via a higher-limit middleware.
+//
+// Both limits:
+//   ✅ Key-based (not IP-based) — correct for shared-IP agent deployments
+//   ✅ Standard RateLimit-* headers returned (client-friendly)
+//   ✅ Consistent 429 JSON error format with retryAfter
+//   ✅ No changes needed for launch.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── agentApiLimiter ───────────────────────────────────────────────────────────
 /**
  * General agent API rate limiter.

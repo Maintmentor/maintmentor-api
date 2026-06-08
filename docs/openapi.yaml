@@ -1,0 +1,912 @@
+openapi: 3.1.0
+
+info:
+  title: MaintMentor Agent API
+  description: |
+    The MaintMentor Agent API gives developers and automation agents access to
+    MaintMentor's AI-powered residential maintenance knowledge. Powered by Gemini,
+    this API handles text queries, image analysis (photo), and credit-based wallet
+    management.
+
+    ## Authentication
+    All agent endpoints (`/api/agent/*`) authenticate via API key passed in the
+    `Authorization` header:
+    ```
+    Authorization: Bearer mm_pk_xxxxxxxxxxxxxxxx
+    ```
+
+    Dashboard endpoints (`/api/dashboard/*`) require a Supabase JWT:
+    ```
+    Authorization: Bearer <supabase-jwt>
+    ```
+
+    ## Rate Limits
+    - General agent endpoints: **100 requests / minute per API key**
+    - Photo endpoint: **10 requests / minute per API key**
+
+    Exceeded limits return HTTP 429 with a `Retry-After` header.
+
+    ## Credits
+    | Endpoint | Credits |
+    |---|---|
+    | POST /api/agent/query | 5 |
+    | POST /api/agent/photo | 15 |
+    | GET /api/agent/usage  | 0 (free) |
+
+  version: "1.0.0"
+  contact:
+    name: MaintMentor Support
+    email: support@maintmentor.ai
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.maintmentor.ai
+    description: Production
+
+security:
+  - apiKey: []
+
+tags:
+  - name: Agent
+    description: AI-powered maintenance query endpoints (API key auth)
+  - name: Dashboard – Wallet
+    description: Wallet balance, credit packs, and top-up (JWT auth)
+  - name: Dashboard – Usage
+    description: Usage analytics and charts (JWT auth)
+  - name: Dashboard – Keys
+    description: API key management (JWT auth)
+
+# ─── Shared components ─────────────────────────────────────────────────────────
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: "mm_pk_*"
+      description: "Agent API key — generated in the dashboard"
+    supabaseJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Supabase auth JWT — obtained from Supabase client"
+
+  schemas:
+    # ── Error ──────────────────────────────────────────────────────────────────
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+          example: "Insufficient wallet balance"
+        code:
+          type: string
+          description: Machine-readable error code
+          example: "INSUFFICIENT_BALANCE"
+        message:
+          type: string
+          description: Additional context (optional)
+
+    # ── RateLimitError ─────────────────────────────────────────────────────────
+    RateLimitError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            retryAfter:
+              type: integer
+              description: Seconds until the rate limit window resets
+              example: 60
+
+    # ── QueryResponse ──────────────────────────────────────────────────────────
+    QueryResponse:
+      type: object
+      required: [answer, confidence, credits_used, wallet_balance, request_id]
+      properties:
+        answer:
+          type: string
+          description: AI-generated maintenance guidance
+          example: "Start by checking the circuit breaker in your electrical panel..."
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Estimated confidence score for the answer
+          example: 0.85
+        credits_used:
+          type: integer
+          description: Credits deducted for this request
+          example: 5
+        wallet_balance:
+          type: number
+          description: Remaining wallet balance after the request
+          example: 45.50
+        request_id:
+          type: string
+          format: uuid
+          description: Unique request identifier for debugging
+          example: "a3f1c2d4-e5b6-7890-abcd-ef1234567890"
+
+    # ── PhotoResponse ──────────────────────────────────────────────────────────
+    PhotoResponse:
+      type: object
+      required: [answer, confidence, issues_found, credits_used, wallet_balance, request_id]
+      properties:
+        answer:
+          type: string
+          description: AI analysis of the uploaded image(s)
+          example: "The image shows signs of water damage around the HVAC unit..."
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          example: 0.78
+        issues_found:
+          type: array
+          items:
+            type: string
+          description: List of specific issues detected in the image(s)
+          example: ["Water stain on ceiling", "Rust on supply pipe", "Cracked insulation"]
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+          description: Overall severity of the detected issues
+          example: "medium"
+        credits_used:
+          type: integer
+          example: 15
+        wallet_balance:
+          type: number
+          example: 30.50
+        request_id:
+          type: string
+          format: uuid
+
+    # ── UsageStats ─────────────────────────────────────────────────────────────
+    UsageStats:
+      type: object
+      properties:
+        wallet_balance:
+          type: number
+          description: Current credit balance
+          example: 30.50
+        today:
+          type: object
+          properties:
+            queries:       { type: integer, example: 3 }
+            photos:        { type: integer, example: 1 }
+            credits_used:  { type: number,  example: 20 }
+        this_month:
+          type: object
+          properties:
+            queries:       { type: integer, example: 47 }
+            photos:        { type: integer, example: 12 }
+            credits_used:  { type: number,  example: 415 }
+        lifetime:
+          type: object
+          properties:
+            queries:       { type: integer, example: 203 }
+            photos:        { type: integer, example: 41 }
+            credits_used:  { type: number,  example: 1630 }
+
+    # ── Wallet ─────────────────────────────────────────────────────────────────
+    Wallet:
+      type: object
+      properties:
+        id:                    { type: string, format: uuid }
+        balance_usd:           { type: number, example: 30.50 }
+        lifetime_queries:      { type: integer, example: 203 }
+        lifetime_spend_usd:    { type: number, example: 16.30 }
+        created_at:            { type: string, format: date-time }
+        updated_at:            { type: string, format: date-time }
+
+    # ── WalletBalance ──────────────────────────────────────────────────────────
+    WalletBalance:
+      type: object
+      properties:
+        balance_credits:
+          type: number
+          description: Current credit balance (1 credit = $0.01)
+          example: 30.50
+        balance_usd:
+          type: number
+          example: 30.50
+        solana_address:
+          type: string
+          nullable: true
+          example: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+        auto_recharge_enabled:
+          type: boolean
+          example: false
+        stripe_customer_id:
+          type: string
+          nullable: true
+          example: "cus_abc123"
+
+    # ── Transaction ────────────────────────────────────────────────────────────
+    Transaction:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        amount_usd:       { type: number, example: 10.00 }
+        type:
+          type: string
+          enum: [credit, debit, refund]
+          example: credit
+        description:      { type: string, example: "Starter Pack (100 credits)" }
+        created_at:       { type: string, format: date-time }
+        token_mint:       { type: string, nullable: true }
+        stripe_payment_intent_id: { type: string, nullable: true }
+
+    # ── CreditPack ─────────────────────────────────────────────────────────────
+    CreditPack:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        name:        { type: string, example: "Starter Pack" }
+        credits:     { type: integer, example: 100 }
+        price_usd:   { type: number, example: 10.00 }
+        description: { type: string, example: "100 credits — enough for 20 text queries or 6 photo analyses" }
+
+    # ── ApiKey ─────────────────────────────────────────────────────────────────
+    ApiKey:
+      type: object
+      properties:
+        id:           { type: string, format: uuid }
+        prefix:       { type: string, example: "mm_pk_a1b2c3d4" }
+        label:        { type: string, nullable: true, example: "Production Bot" }
+        is_active:    { type: boolean, example: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        created_at:   { type: string, format: date-time }
+        revoked_at:   { type: string, format: date-time, nullable: true }
+
+    # ── UsageSummaryPeriod ─────────────────────────────────────────────────────
+    UsageSummaryPeriod:
+      type: object
+      properties:
+        queries:      { type: integer }
+        photos:       { type: integer }
+        credits_used: { type: number }
+
+# ─── Paths ─────────────────────────────────────────────────────────────────────
+paths:
+
+  # ─── Agent Endpoints ──────────────────────────────────────────────────────────
+
+  /api/agent/query:
+    post:
+      tags: [Agent]
+      operationId: agentQuery
+      summary: Submit a maintenance text query
+      description: |
+        Ask MaintMentor a residential maintenance question. Returns AI-generated
+        guidance powered by Gemini.
+
+        **Cost:** 5 credits per request.
+
+        **Rate limit:** 100 requests/minute per API key.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question:
+                  type: string
+                  maxLength: 2000
+                  description: The maintenance question to answer
+                  example: "My HVAC unit is making a loud banging noise when it starts. What could cause this?"
+                context:
+                  type: object
+                  description: Optional context about the appliance or situation
+                  properties:
+                    appliance_type:
+                      type: string
+                      example: "HVAC"
+                    model:
+                      type: string
+                      example: "Carrier 24ACC636A003"
+                    age_years:
+                      type: integer
+                      example: 8
+                response_format:
+                  type: string
+                  enum: [text, structured]
+                  default: text
+                  description: |
+                    `text` returns a plain answer string.
+                    `structured` returns additional metadata when available.
+            example:
+              question: "My HVAC unit is making a loud banging noise when it starts."
+              context:
+                appliance_type: HVAC
+                age_years: 8
+              response_format: text
+      responses:
+        "200":
+          description: Successful query response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+              example:
+                answer: "A loud banging noise on startup often indicates a loose or broken part inside the blower..."
+                confidence: 0.85
+                credits_used: 5
+                wallet_balance: 45.0
+                request_id: "a3f1c2d4-e5b6-7890-abcd-ef1234567890"
+        "400":
+          description: Validation error (missing question, too long, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "402":
+          description: Insufficient wallet balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "Insufficient wallet balance"
+                code: "INSUFFICIENT_BALANCE"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateLimitError'
+        "503":
+          description: AI service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/agent/photo:
+    post:
+      tags: [Agent]
+      operationId: agentPhoto
+      summary: Analyze maintenance photos
+      description: |
+        Upload one or more images of a maintenance issue and receive AI-powered
+        visual analysis. Powered by Gemini Vision.
+
+        **Cost:** 15 credits per request.
+
+        **Rate limit:** 10 requests/minute per API key.
+
+        Images must be provided as base64-encoded data URIs or publicly accessible URLs.
+        Maximum 5 images per request.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question, images]
+              properties:
+                question:
+                  type: string
+                  maxLength: 2000
+                  description: Describe what you want to know about the image(s)
+                  example: "What is causing this stain on my ceiling?"
+                images:
+                  type: array
+                  maxItems: 5
+                  items:
+                    type: string
+                    description: |
+                      Base64 data URI (`data:image/jpeg;base64,...`) or
+                      a publicly accessible HTTPS image URL.
+                  description: One to five images to analyze
+            example:
+              question: "What is causing this stain on my ceiling?"
+              images:
+                - "data:image/jpeg;base64,/9j/4AAQSkZJRgAB..."
+      responses:
+        "200":
+          description: Photo analysis result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhotoResponse'
+        "400":
+          description: Validation error (no images, too many images, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "402":
+          description: Insufficient wallet balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateLimitError'
+
+  /api/agent/usage:
+    get:
+      tags: [Agent]
+      operationId: agentUsage
+      summary: Get usage stats for the authenticated API key
+      description: |
+        Returns wallet balance and usage statistics (today / this month / lifetime)
+        for the API key used in the request.
+
+        **Cost:** Free (0 credits).
+
+        Use this endpoint to monitor usage and check remaining balance before
+        submitting expensive queries.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Usage stats for the authenticated key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageStats'
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ─── Dashboard – Wallet ───────────────────────────────────────────────────────
+
+  /api/dashboard/wallet/topup:
+    post:
+      tags: [Dashboard – Wallet]
+      operationId: walletTopup
+      summary: Create Stripe Checkout session to purchase credits
+      description: |
+        Initiates a Stripe Checkout session for a credit pack purchase.
+        Returns a `checkout_url` that the user should be redirected to.
+
+        On success, Stripe sends a webhook that credits the wallet automatically.
+      security:
+        - supabaseJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack_id]
+              properties:
+                pack_id:
+                  type: string
+                  format: uuid
+                  description: ID of the credit pack to purchase (see GET /wallet/packs)
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: Stripe Checkout session created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  checkout_url:
+                    type: string
+                    format: uri
+                    description: Redirect the user to this URL to complete payment
+                  session_id:
+                    type: string
+                    description: Stripe Checkout Session ID
+              example:
+                checkout_url: "https://checkout.stripe.com/pay/cs_test_abc123"
+                session_id: "cs_test_abc123"
+        "400":
+          description: Missing pack_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          description: Credit pack not found or inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/dashboard/wallet/packs:
+    get:
+      tags: [Dashboard – Wallet]
+      operationId: walletPacks
+      summary: List available credit packs
+      description: Returns all active credit packs available for purchase.
+      security:
+        - supabaseJWT: []
+      responses:
+        "200":
+          description: List of available credit packs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  packs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CreditPack'
+
+  /api/dashboard/wallet/balance:
+    get:
+      tags: [Dashboard – Wallet]
+      operationId: walletBalance
+      summary: Get wallet balance and details
+      description: Returns the current wallet balance, Solana address, and Stripe info.
+      security:
+        - supabaseJWT: []
+      responses:
+        "200":
+          description: Wallet balance details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletBalance'
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          description: Wallet not found (create an API key first)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/dashboard/wallet/transactions:
+    get:
+      tags: [Dashboard – Wallet]
+      operationId: walletTransactions
+      summary: Get paginated transaction history
+      description: Returns paginated credit debit/credit history for the wallet.
+      security:
+        - supabaseJWT: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Number of transactions to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Pagination offset
+      responses:
+        "200":
+          description: Paginated transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Transaction'
+                  total:
+                    type: integer
+                    description: Total number of transactions
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          description: Wallet not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ─── Dashboard – Usage ────────────────────────────────────────────────────────
+
+  /api/dashboard/usage/summary:
+    get:
+      tags: [Dashboard – Usage]
+      operationId: usageSummary
+      summary: Get usage summary (today / this month / lifetime)
+      description: |
+        Returns aggregated query and credit-usage statistics broken down by
+        today, this month, and lifetime. Also returns top endpoint categories.
+      security:
+        - supabaseJWT: []
+      responses:
+        "200":
+          description: Usage summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  today:
+                    $ref: '#/components/schemas/UsageSummaryPeriod'
+                  this_month:
+                    $ref: '#/components/schemas/UsageSummaryPeriod'
+                  lifetime:
+                    $ref: '#/components/schemas/UsageSummaryPeriod'
+                  top_categories:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        category: { type: string }
+                        count:    { type: integer }
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/dashboard/usage/chart:
+    get:
+      tags: [Dashboard – Usage]
+      operationId: usageChart
+      summary: Get daily usage data for charting
+      description: |
+        Returns day-by-day query counts and credit usage for the specified
+        number of past days. Suitable for rendering a time-series chart.
+      security:
+        - supabaseJWT: []
+      parameters:
+        - name: days
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 90
+            default: 30
+          description: Number of past days to include in the chart data
+      responses:
+        "200":
+          description: Chart data arrays
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  labels:
+                    type: array
+                    items:
+                      type: string
+                      format: date
+                    description: ISO date strings for each day (ascending)
+                    example: ["2026-06-01", "2026-06-02"]
+                  queries:
+                    type: array
+                    items:
+                      type: integer
+                    description: Query count per day
+                    example: [5, 12]
+                  credits:
+                    type: array
+                    items:
+                      type: number
+                    description: Credits used per day
+                    example: [25, 60]
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ─── Dashboard – Keys ─────────────────────────────────────────────────────────
+
+  /api/dashboard/keys:
+    post:
+      tags: [Dashboard – Keys]
+      operationId: createApiKey
+      summary: Create a new API key
+      description: |
+        Generates a new API key for the authenticated user.
+
+        **IMPORTANT:** The full key is returned **once** in this response and
+        never stored or shown again. Store it securely immediately.
+      security:
+        - supabaseJWT: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  description: Optional human-readable label for the key
+                  example: "My Production Bot"
+      responses:
+        "201":
+          description: API key created — store the key now, it won't be shown again
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key:
+                    type: string
+                    description: "Full API key — shown ONCE. Store immediately."
+                    example: "mm_pk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"
+                  prefix:
+                    type: string
+                    example: "mm_pk_a1b2c3d4"
+                  label:
+                    type: string
+                    nullable: true
+                  created_at:
+                    type: string
+                    format: date-time
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/dashboard/keys/{id}:
+    delete:
+      tags: [Dashboard – Keys]
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: |
+        Permanently deactivates an API key. Revocation is immediate and irreversible.
+        Requests using the revoked key will be rejected.
+
+        Revoking an already-revoked key is idempotent (returns 204).
+      security:
+        - supabaseJWT: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: The API key ID to revoke
+      responses:
+        "204":
+          description: Key revoked (no body)
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          description: Key not found or belongs to a different user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/dashboard/keys/rotate:
+    post:
+      tags: [Dashboard – Keys]
+      operationId: rotateApiKey
+      summary: Rotate an API key
+      description: |
+        Atomically revokes the specified key and issues a replacement.
+        The old key is immediately deactivated; the new key is returned **once**.
+
+        Use key rotation as part of regular security hygiene or when a key
+        may have been compromised.
+      security:
+        - supabaseJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key_id]
+              properties:
+                key_id:
+                  type: string
+                  format: uuid
+                  description: ID of the active key to rotate
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: New key created, old key revoked — store the key now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key:
+                    type: string
+                    description: "New full API key — shown ONCE"
+                    example: "mm_pk_z9y8x7w6v5u4t3s2r1q0p9o8n7m6l5k4"
+                  prefix:
+                    type: string
+                    example: "mm_pk_z9y8x7w6"
+                  label:
+                    type: string
+                    nullable: true
+                  created_at:
+                    type: string
+                    format: date-time
+                  rotated_key_id:
+                    type: string
+                    format: uuid
+                    description: ID of the old key that was revoked
+        "400":
+          description: Missing key_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "404":
+          description: Key not found or belongs to a different user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "409":
+          description: Key is already revoked (cannot rotate an inactive key)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "API key is already revoked — cannot rotate an inactive key"
+                code: "KEY_ALREADY_REVOKED"
