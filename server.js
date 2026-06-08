@@ -979,6 +979,13 @@ registerBillingRoutes(app);
   console.log('   Routes: /api/agent registered ✅');
 }
 
+// ─── Certifications & Learning Platform (Day 13) ──────────────────────────────
+{
+  const certificationsRouter = require('./routes/certifications');
+  app.use('/api/certifications', certificationsRouter);
+  console.log('   Routes: /api/certifications registered ✅');
+}
+
 // ─── Start Server ──────────────────────────────────────────────────────────────
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 app.listen(PORT, HOST, async () => {
