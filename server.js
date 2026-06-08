@@ -1,5 +1,9 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
+const swaggerUi = require('swagger-ui-express');
+const yaml = require('js-yaml');
+const fs = require('fs');
+const path = require('path');
 const logger  = require('./lib/logger');
 const requestLogger = require('./middleware/requestLogger');
 const cors = require('cors');
@@ -843,6 +847,19 @@ registerHeroRoutes(app);
 // ─── Stripe Billing Routes ─────────────────────────────────────────────────────
 registerBillingRoutes(app);
 
+// ─── Swagger UI (Developer Docs) ────────────────────────────────────────────
+{
+  const openapiPath = path.join(__dirname, 'docs', 'openapi.yaml');
+  const swaggerDocument = yaml.load(fs.readFileSync(openapiPath, 'utf8'));
+  // Redirect /api/docs → /api/docs/
+  app.get('/api/docs', (req, res) => res.redirect('/api/docs/'));
+  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument, {
+    customSiteTitle: 'MaintMentor API Docs',
+    customCss: '.swagger-ui .topbar { background-color: #1e293b; } .swagger-ui .topbar-wrapper img { content: url(https://maintmentor.ai/icons/maintmentor-logo.png); }',
+  }));
+  console.log('   Routes: /api/docs (Swagger UI) registered ✅');
+}
+
 // ─── Dashboard Routes (API Key Management + Wallet) ───────────────────────────
 {
   const { requireJWT } = require('./middleware/auth');
@@ -872,9 +889,20 @@ app.listen(PORT, HOST, async () => {
 
   // Start periodic anomaly scan (every 15 minutes)
   if (process.env.NODE_ENV !== 'test') {
-    const { startAnomalyScan } = require('./lib/anomalyDetector');
+    const { startAnomalyScan, sendDailyAnomalySummary } = require('./lib/anomalyDetector');
     startAnomalyScan();
     console.log('   Anomaly scanner: ✅ started (15 min interval)');
+
+    // Wire daily anomaly digest — first run after 60s, then every 24h
+    setTimeout(async () => {
+      console.log('[anomaly-digest] Running initial daily summary...');
+      try { await sendDailyAnomalySummary(); } catch (e) { console.error('[anomaly-digest] Error:', e.message); }
+      setInterval(async () => {
+        console.log('[anomaly-digest] Running scheduled daily summary...');
+        try { await sendDailyAnomalySummary(); } catch (e) { console.error('[anomaly-digest] Error:', e.message); }
+      }, 24 * 60 * 60 * 1000);
+    }, 60 * 1000);
+    console.log('   Anomaly digest: ✅ wired (60s delay, then 24h interval)');
   }
 });
 
