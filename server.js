@@ -908,17 +908,28 @@ app.post('/api/chat', async (req, res) => {
     const category = detectCategory(question, answer);
     const duration = Date.now() - startTime;
 
-    // ─── Log query for team analytics (non-blocking) ──────────────────
+    // ─── Log query for team analytics + data flywheel (non-blocking) ──────
+    // Gemini usage metadata (needed for token counts below)
+    const usageMeta = geminiResponse.response?.usageMetadata;
     logQuery({
       userId,
       queryType: hasPhotos ? 'photo' : 'chat',
       category,
       questionPreview: question,
+      // ── Data flywheel: full Q&A capture ──
+      fullQuestion:  question,
+      aiAnswer:      answer,
+      modelUsed:     selectedModel,
+      tokensInput:   usageMeta?.promptTokenCount     || 0,
+      tokensOutput:  usageMeta?.candidatesTokenCount || 0,
+      latencyMs:     duration,
+      source:        'consumer_app',
+      accountId:     userId,
+      hasPhoto:      hasPhotos || false,
     }).catch(() => {});
 
     // ─── CONTROL 5: Record API spend ──────────────────────────────────────
-    // Gemini usage metadata
-    const usageMeta = geminiResponse.response?.usageMetadata;
+    // (usageMeta already captured above)
     const spendInfo = recordSpend(
       usageMeta?.promptTokenCount || 0,
       usageMeta?.candidatesTokenCount || 0,

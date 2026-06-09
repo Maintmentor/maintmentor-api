@@ -51,10 +51,50 @@ async function getUserOrgId(userId) {
 // ─── Query Logging ─────────────────────────────────────────────────────────────
 
 /**
- * Log a query to the query_log table.
- * Called from the chat endpoint after a successful response.
+ * Anonymize query text before storage — strips PII per spec Section 12.5.
+ * Removes emails, phone numbers, Solana wallet addresses, and street addresses.
  */
-async function logQuery({ userId, orgId, queryType, category, questionPreview }) {
+function anonymizeQuery(text) {
+  if (!text) return '';
+  return text
+    .replace(/[\w.-]+@[\w.-]+\.\w+/g, '[EMAIL]')
+    .replace(/\b(\+1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g, '[PHONE]')
+    .replace(/\b[A-HJ-NP-Z1-9]{32,44}\b/g, '[WALLET_ADDRESS]')  // Solana base58
+    .replace(/\b\d{1,5}\s[\w\s]{1,30}\b(street|st|avenue|ave|road|rd|blvd|drive|dr)\b/gi, '[ADDRESS]');
+}
+
+/**
+ * Log a query to query_log (team analytics) AND query_history (data flywheel).
+ * Called from the chat endpoint after a successful response.
+ *
+ * New params (all optional — graceful degradation if not provided):
+ *   fullQuestion   - Full question text (will be anonymized before storage)
+ *   aiAnswer       - Full AI response text
+ *   modelUsed      - Model identifier, e.g. 'gemini-2.0-flash'
+ *   tokensInput    - Prompt token count
+ *   tokensOutput   - Completion token count
+ *   latencyMs      - Wall-clock request latency in ms
+ *   source         - 'consumer_app' or 'agent_api'
+ *   accountId      - Supabase user UUID (same as userId if authenticated)
+ *   hasPhoto       - Boolean: was a photo included in this query
+ */
+async function logQuery({
+  userId,
+  orgId,
+  queryType,
+  category,
+  questionPreview,
+  // Data flywheel fields:
+  fullQuestion,
+  aiAnswer,
+  modelUsed,
+  tokensInput,
+  tokensOutput,
+  latencyMs,
+  source,
+  accountId,
+  hasPhoto,
+}) {
   try {
     if (!userId) return;
 
@@ -65,14 +105,37 @@ async function logQuery({ userId, orgId, queryType, category, questionPreview })
       finalOrgId = membership?.org_id || null;
     }
 
+    // ── 1. Legacy query_log insert (team analytics dashboards) ──────────────
     await supabase.from('query_log').insert({
       user_id: userId,
       org_id: finalOrgId,
       query_type: queryType || 'chat',
       category: category || 'Other',
-      question_preview: (questionPreview || '').substring(0, 120),
+      question_preview: (questionPreview || fullQuestion || '').substring(0, 120),
       created_at: new Date().toISOString(),
     });
+
+    // ── 2. Data flywheel insert — full Q&A capture ───────────────────────────
+    // Fire-and-forget: never block the caller or throw
+    const rawQuestion = fullQuestion || questionPreview || '';
+    if (rawQuestion) {
+      const cleanQuestion = anonymizeQuery(rawQuestion);
+      supabase.from('query_history').insert({
+        question:       cleanQuestion,
+        ai_answer:      aiAnswer       || null,
+        model_used:     modelUsed      || 'unknown',
+        tokens_input:   tokensInput    || 0,
+        tokens_output:  tokensOutput   || 0,
+        latency_ms:     latencyMs      || 0,
+        source:         source         || 'consumer_app',
+        account_id:     accountId      || userId || null,
+        has_photo:      hasPhoto       || false,
+        embedding_status: 'pending',
+      }).then(({ error }) => {
+        if (error) console.error('[team-analytics] query_history insert error:', error.message);
+        else console.log('[team-analytics] ✅ query_history row captured');
+      });
+    }
   } catch (err) {
     console.error('[team-analytics] logQuery error:', err.message);
   }
