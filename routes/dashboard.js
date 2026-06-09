@@ -1063,7 +1063,7 @@ router.post('/keys/rotate', async (req, res) => {
  * Response:
  *   201 { alert_id, alert_type, threshold, enabled }
  */
-router.post('/alerts', requireJWT, async (req, res) => {
+router.post('/alerts', async (req, res) => {
   const userId = req.user.id;
   const { alert_type = 'low_balance', threshold, enabled = true } = req.body || {};
 
@@ -1124,7 +1124,7 @@ router.post('/alerts', requireJWT, async (req, res) => {
 });
 
 // ─── GET /alerts ──────────────────────────────────────────────────────────────
-router.get('/alerts', requireJWT, async (req, res) => {
+router.get('/alerts', async (req, res) => {
   const userId = req.user.id;
   try {
     const { data: alerts, error } = await supabase
@@ -1142,7 +1142,7 @@ router.get('/alerts', requireJWT, async (req, res) => {
 });
 
 // ─── DELETE /alerts/:id ───────────────────────────────────────────────────────
-router.delete('/alerts/:id', requireJWT, async (req, res) => {
+router.delete('/alerts/:id', async (req, res) => {
   const userId = req.user.id;
   const { id } = req.params;
   try {
