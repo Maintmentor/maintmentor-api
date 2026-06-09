@@ -1053,6 +1053,113 @@ router.post('/keys/rotate', async (req, res) => {
   }
 });
 
+// ─── POST /alerts ───────────────────────────────────────────────────────────────
+/**
+ * Set a low-balance usage alert threshold.
+ *
+ * Request body:
+ *   { alert_type: 'low_balance', threshold: number, enabled?: boolean }
+ *
+ * Response:
+ *   201 { alert_id, alert_type, threshold, enabled }
+ */
+router.post('/alerts', requireJWT, async (req, res) => {
+  const userId = req.user.id;
+  const { alert_type = 'low_balance', threshold, enabled = true } = req.body || {};
+
+  if (threshold === undefined || threshold === null) {
+    return res.status(400).json({ error: 'threshold is required', code: 'MISSING_THRESHOLD' });
+  }
+
+  const thresh = Number(threshold);
+  if (isNaN(thresh) || thresh < 0) {
+    return res.status(400).json({ error: 'threshold must be a non-negative number', code: 'INVALID_THRESHOLD' });
+  }
+
+  try {
+    // Upsert alert — one alert per user per type
+    const { data: existing } = await supabase
+      .from('user_alerts')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('alert_type', alert_type)
+      .maybeSingle();
+
+    let alert;
+    if (existing) {
+      const { data: updated, error } = await supabase
+        .from('user_alerts')
+        .update({ threshold: thresh, enabled: Boolean(enabled) })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      if (error) throw error;
+      alert = updated;
+    } else {
+      const { data: inserted, error } = await supabase
+        .from('user_alerts')
+        .insert({ user_id: userId, alert_type, threshold: thresh, enabled: Boolean(enabled) })
+        .select()
+        .single();
+      if (error) throw error;
+      alert = inserted;
+    }
+
+    console.log(`[dashboard] Alert set — user: ${userId}, type: ${alert_type}, threshold: ${thresh}`);
+
+    return res.status(201).json({
+      success: true,
+      alert: {
+        id:         alert.id,
+        alert_type: alert.alert_type,
+        threshold:  alert.threshold,
+        enabled:    alert.enabled,
+        created_at: alert.created_at,
+      },
+    });
+  } catch (err) {
+    console.error('[dashboard] POST /alerts error:', err.message);
+    return res.status(500).json({ error: 'Failed to save alert', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// ─── GET /alerts ──────────────────────────────────────────────────────────────
+router.get('/alerts', requireJWT, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const { data: alerts, error } = await supabase
+      .from('user_alerts')
+      .select('id, alert_type, threshold, enabled, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return res.json({ success: true, alerts: alerts || [] });
+  } catch (err) {
+    console.error('[dashboard] GET /alerts error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch alerts', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// ─── DELETE /alerts/:id ───────────────────────────────────────────────────────
+router.delete('/alerts/:id', requireJWT, async (req, res) => {
+  const userId = req.user.id;
+  const { id } = req.params;
+  try {
+    const { error } = await supabase
+      .from('user_alerts')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId); // ensure ownership
+
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[dashboard] DELETE /alerts error:', err.message);
+    return res.status(500).json({ error: 'Failed to delete alert', code: 'INTERNAL_ERROR' });
+  }
+});
+
 module.exports = router;
 
 

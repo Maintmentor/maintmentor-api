@@ -406,9 +406,184 @@ async function sendOnboardingSequence(user) {
   console.log(`[onboarding] Sequence queued for ${user.email} (welcome now, day-3 in 72h, day-7 in 168h)`);
 }
 
+// ─── Weekly Progress Email ────────────────────────────────────────────────────────────
+
+/**
+ * Build HTML for weekly progress email.
+ */
+function weeklyProgressTemplate({ user, stats, nextLesson }) {
+  const name = firstName(user);
+  const {
+    lessons_completed = 0,
+    queries_asked     = 0,
+    credits_used      = 0,
+    tracks_in_progress = 0,
+  } = stats || {};
+
+  const nextLessonBlock = nextLesson
+    ? `<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:16px 20px;margin-bottom:24px">
+        <p style="color:#1d4ed8;font-size:14px;font-weight:600;margin:0 0 6px">➡️ Up next for you:</p>
+        <p style="color:#1e40af;font-size:15px;font-weight:700;margin:0 0 4px">${nextLesson.title}</p>
+        <p style="color:#3b82f6;font-size:13px;margin:0 0 12px">${nextLesson.track || ''}</p>
+        <a href="${APP_URL}/certifications" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:700;font-size:13px;padding:8px 20px;border-radius:8px;text-decoration:none">Continue Learning →</a>
+      </div>`
+    : '';
+
+  return {
+    subject: `📊 Your MaintMentor week in review`,
+    html: `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f8fafc;font-family:'Segoe UI',Roboto,Arial,sans-serif">
+  <div style="max-width:600px;margin:0 auto;padding:24px 16px">
+    <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);border-radius:16px 16px 0 0;padding:28px 32px;text-align:center">
+      <div style="font-size:32px;margin-bottom:6px">📊</div>
+      <h1 style="color:#f59e0b;font-size:22px;font-weight:800;margin:0 0 4px">Weekly Progress</h1>
+      <p style="color:#94a3b8;font-size:13px;margin:0">Your MaintMentor summary</p>
+    </div>
+    <div style="background:#fff;padding:32px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0">
+      <p style="color:#0f172a;font-size:17px;font-weight:600;margin:0 0 20px">Hey ${name}! Here's your week at a glance 👋</p>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+        <tr>
+          <td style="padding:14px;background:#f0fdf4;border-radius:10px;text-align:center;width:30%">
+            <div style="font-size:28px;font-weight:800;color:#15803d">${lessons_completed}</div>
+            <div style="font-size:12px;color:#166534;margin-top:4px">Lessons<br>Completed</div>
+          </td>
+          <td style="width:5%"></td>
+          <td style="padding:14px;background:#eff6ff;border-radius:10px;text-align:center;width:30%">
+            <div style="font-size:28px;font-weight:800;color:#1d4ed8">${queries_asked}</div>
+            <div style="font-size:12px;color:#1e40af;margin-top:4px">AI Queries<br>Asked</div>
+          </td>
+          <td style="width:5%"></td>
+          <td style="padding:14px;background:#fdf4ff;border-radius:10px;text-align:center;width:30%">
+            <div style="font-size:28px;font-weight:800;color:#7e22ce">${credits_used}</div>
+            <div style="font-size:12px;color:#6b21a8;margin-top:4px">Credits<br>Used</div>
+          </td>
+        </tr>
+      </table>
+      ${nextLessonBlock}
+      <div style="text-align:center;margin-bottom:24px">
+        <a href="${APP_URL}/dashboard" style="display:inline-block;background:#f59e0b;color:#0f172a;font-weight:800;font-size:15px;padding:12px 32px;border-radius:10px;text-decoration:none">Open Dashboard →</a>
+      </div>
+    </div>
+    <div style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:0 0 16px 16px;padding:16px 32px;text-align:center">
+      <p style="color:#94a3b8;font-size:12px;margin:0">MaintMentor · <a href="${APP_URL}/unsubscribe" style="color:#94a3b8">Unsubscribe</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+/**
+ * Send a weekly progress email for a single user.
+ *
+ * @param {string} userId  — Supabase user ID
+ * Fetches user profile, weekly stats from Supabase, and sends the email.
+ */
+async function sendWeeklyProgressEmail(userId) {
+  const { createClient } = require('@supabase/supabase-js');
+  const SUPABASE_URL = process.env.SUPABASE_URL;
+  const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error('[weekly-email] Missing Supabase credentials');
+    return;
+  }
+  const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  // Get user profile
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('full_name, email')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (!profile?.email) {
+    console.warn(`[weekly-email] No profile/email for user ${userId}`);
+    return;
+  }
+
+  const user = { email: profile.email, user_metadata: { full_name: profile.full_name } };
+
+  // Get weekly stats
+  const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  // Queries asked this week (from query_logs if available)
+  let queriesAsked = 0;
+  try {
+    const { count } = await supabase
+      .from('query_logs')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', oneWeekAgo);
+    queriesAsked = count || 0;
+  } catch (_) {}
+
+  // Lessons completed this week
+  let lessonsCompleted = 0;
+  let nextLesson = null;
+  try {
+    const { count } = await supabase
+      .from('lesson_progress')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('completed', true)
+      .gte('completed_at', oneWeekAgo);
+    lessonsCompleted = count || 0;
+
+    // Next recommended lesson = first incomplete lesson in any track
+    const { data: nextItems } = await supabase
+      .from('lesson_progress')
+      .select('lesson_id')
+      .eq('user_id', userId)
+      .eq('completed', false)
+      .limit(1);
+    if (nextItems?.[0]) {
+      const { data: lesson } = await supabase
+        .from('lessons')
+        .select('title, track_id')
+        .eq('id', nextItems[0].lesson_id)
+        .maybeSingle();
+      if (lesson) nextLesson = { title: lesson.title };
+    }
+  } catch (_) {}
+
+  // Credits used this week
+  let creditsUsed = 0;
+  try {
+    const { data: txns } = await supabase
+      .from('wallet_transactions')
+      .select('amount')
+      .eq('user_id', userId)
+      .eq('type', 'debit')
+      .gte('created_at', oneWeekAgo);
+    creditsUsed = (txns || []).reduce((sum, t) => sum + Math.abs(t.amount || 0), 0);
+  } catch (_) {}
+
+  const stats = {
+    lessons_completed: lessonsCompleted,
+    queries_asked:     queriesAsked,
+    credits_used:      creditsUsed,
+  };
+
+  const resend = getResend();
+  const { subject, html } = weeklyProgressTemplate({ user, stats, nextLesson });
+
+  const result = await resend.emails.send({
+    from: FROM_EMAIL,
+    to:   profile.email,
+    subject,
+    html,
+  });
+
+  console.log(`[weekly-email] Sent to ${profile.email}:`, result?.id || '');
+  return result;
+}
+
 module.exports = {
   sendWelcomeEmail,
   sendDay3FollowUp,
   sendDay7CheckIn,
   sendOnboardingSequence,
+  sendWeeklyProgressEmail,
 };

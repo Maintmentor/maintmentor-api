@@ -1158,6 +1158,126 @@ registerBillingRoutes(app);
   console.log('   Routes: /api/certifications registered ✅');
 }
 
+// ─── Referrals Routes (Day 15) ───────────────────────────────────────────────
+{
+  const referralsRouter = require('./routes/referrals');
+  app.use('/api/referrals', referralsRouter);
+  console.log('   Routes: /api/referrals registered ✅');
+}
+
+// ─── /api/teams — Day 15 thin wrappers over team-manager ──────────────────────
+// team-manager already registers /api/team/* routes; these REST aliases
+// provide the canonical Day 15 contract.
+{
+  const { requireJWT } = require('./middleware/auth');
+
+  // POST /api/teams — create a team (owner = JWT user)
+  app.post('/api/teams', requireJWT, (req, res) => {
+    // Proxy to team-manager handler — inject userId from JWT
+    req.body = req.body || {};
+    req.body.userId = req.user.id;
+    // Re-use team-manager logic via internal call to supabase
+    const supabase = require('./lib/supabase');
+    const name  = req.body.name;
+    const email = req.body.email || req.user.email;
+    if (!name) return res.status(400).json({ success: false, error: 'name is required' });
+    // Fire create-org logic inline
+    (async () => {
+      try {
+        const crypto = require('crypto');
+        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').substring(0, 60)
+          + '-' + crypto.randomBytes(3).toString('hex');
+        const { data: org, error } = await supabase.from('organizations').insert({
+          name, slug,
+          billing_email: email || null,
+          plan_type: 'team',
+          subscription_status: 'trialing',
+          seat_count: 1,
+          trial_ends_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          created_by: req.user.id,
+        }).select().single();
+        if (error) return res.status(500).json({ success: false, error: error.message });
+        // Add owner as admin
+        await supabase.from('organization_members').insert({
+          org_id: org.id, user_id: req.user.id, role: 'owner',
+          status: 'active', invited_email: email || null, invited_by: req.user.id,
+          joined_at: new Date().toISOString(),
+        });
+        await supabase.from('profiles').update({ org_id: org.id, org_role: 'admin' }).eq('id', req.user.id);
+        res.status(201).json({ success: true, team: org });
+      } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+      }
+    })();
+  });
+
+  // POST /api/teams/:id/invite — invite a member by email
+  app.post('/api/teams/:id/invite', requireJWT, (req, res) => {
+    req.body = { ...(req.body || {}), orgId: req.params.id };
+    // Proxy to existing /api/team/invite-member handler
+    req.url = '/api/team/invite-member';
+    // Just call the supabase logic directly
+    const supabase = require('./lib/supabase');
+    const { email } = req.body;
+    const orgId = req.params.id;
+    const userId = req.user.id;
+    if (!email) return res.status(400).json({ success: false, error: 'email is required' });
+    (async () => {
+      try {
+        const crypto = require('crypto');
+        const token = crypto.randomBytes(32).toString('hex');
+        const { data: member, error: me } = await supabase.from('organization_members').insert({
+          org_id: orgId, role: 'member', status: 'invited',
+          invited_email: email.toLowerCase(), invited_by: userId,
+        }).select().single();
+        if (me) return res.status(500).json({ success: false, error: me.message });
+        await supabase.from('organization_invites').insert({
+          org_id: orgId, member_id: member.id, token,
+          expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        });
+        const inviteLink = `${process.env.APP_URL || 'https://maintmentor.ai'}/invite/${token}`;
+        res.status(201).json({ success: true, invite_link: inviteLink, member_id: member.id });
+      } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+      }
+    })();
+  });
+
+  // GET /api/teams/:id/members
+  app.get('/api/teams/:id/members', requireJWT, async (req, res) => {
+    const supabase = require('./lib/supabase');
+    try {
+      const { data: members, error } = await supabase
+        .from('organization_members')
+        .select('id, user_id, role, status, invited_email, joined_at')
+        .eq('org_id', req.params.id)
+        .in('status', ['active', 'invited']);
+      if (error) return res.status(500).json({ success: false, error: error.message });
+      res.json({ success: true, members: members || [] });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  // DELETE /api/teams/:id/members/:userId
+  app.delete('/api/teams/:id/members/:userId', requireJWT, async (req, res) => {
+    const supabase = require('./lib/supabase');
+    try {
+      const { error } = await supabase
+        .from('organization_members')
+        .update({ status: 'disabled', disabled_at: new Date().toISOString() })
+        .eq('org_id', req.params.id)
+        .eq('user_id', req.params.userId);
+      if (error) return res.status(500).json({ success: false, error: error.message });
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  console.log('   Routes: /api/teams (Day 15 REST aliases) registered ✅');
+}
+
 // ─── Start Server ──────────────────────────────────────────────────────────────
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 app.listen(PORT, HOST, async () => {
@@ -1186,6 +1306,36 @@ app.listen(PORT, HOST, async () => {
       }, 24 * 60 * 60 * 1000);
     }, 60 * 1000);
     console.log('   Anomaly digest: ✅ wired (60s delay, then 24h interval)');
+
+    // Wire weekly progress email batch — runs every 7 days
+    // (scans all active users and sends individual weekly summaries)
+    const WEEKLY_MS = 7 * 24 * 60 * 60 * 1000;
+    setInterval(async () => {
+      console.log('[weekly-email] Starting weekly batch send...');
+      try {
+        const { sendWeeklyProgressEmail } = require('./scripts/send-onboarding-email');
+        const supabaseAdmin = require('./lib/supabase');
+        const { data: users } = await supabaseAdmin
+          .from('profiles')
+          .select('id')
+          .not('email', 'is', null)
+          .limit(1000);
+        if (users && users.length > 0) {
+          console.log(`[weekly-email] Sending to ${users.length} users...`);
+          for (const u of users) {
+            try { await sendWeeklyProgressEmail(u.id); } catch (e) {
+              console.error(`[weekly-email] Failed for ${u.id}:`, e.message);
+            }
+            // Rate-limit Resend: ~2 emails/sec
+            await new Promise(r => setTimeout(r, 500));
+          }
+          console.log('[weekly-email] Batch complete.');
+        }
+      } catch (e) {
+        console.error('[weekly-email] Batch error:', e.message);
+      }
+    }, WEEKLY_MS);
+    console.log('   Weekly progress emails: ✅ wired (7-day interval)');
   }
 });
 
