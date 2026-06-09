@@ -222,6 +222,15 @@ app.use('/api/webhooks', express.raw({ type: 'application/json' }), stripeWebhoo
 app.use(express.json({ limit: '10mb' }));
 app.use(requestLogger);
 
+// ─── Version Endpoint ────────────────────────────────────────────────────────
+app.get('/api/version', (req, res) => {
+  res.json({
+    version: '1.0.0',
+    build: 'day16',
+    environment: process.env.NODE_ENV || 'production'
+  });
+});
+
 // ─── Enhanced Health Check ────────────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   const spend = getSpendSummary();
