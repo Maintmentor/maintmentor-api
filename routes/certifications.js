@@ -1,5 +1,11 @@
 'use strict';
 
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+const TRANSLATE_MODEL = process.env.GEMINI_MODEL_FLASH || 'gemini-2.5-flash';
+
 /**
  * routes/certifications.js
  *
@@ -665,6 +671,61 @@ router.get('/leaderboard', async (req, res) => {
     });
   } catch (err) {
     return handleError(res, err, 'GET /leaderboard');
+  }
+});
+
+// ─── POST /translate — Auth required ─────────────────────────────────────────
+/**
+ * Body: { content: object|string, targetLanguage: string, contentType: 'lesson'|'quiz'|'track' }
+ * Translates lesson/quiz content on the fly using Gemini.
+ */
+router.post('/translate', requireJWT, async (req, res) => {
+  const { content, targetLanguage, contentType } = req.body;
+
+  if (!content || !targetLanguage) {
+    return res.status(400).json({ success: false, error: 'content and targetLanguage are required' });
+  }
+
+  // If target is English, skip translation
+  if (targetLanguage.startsWith('en')) {
+    return res.json({ success: true, translated: content });
+  }
+
+  if (!genAI) {
+    return res.status(503).json({ success: false, error: 'Translation service unavailable — GEMINI_API_KEY not set' });
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: TRANSLATE_MODEL });
+
+    const langName = targetLanguage; // e.g. "es-ES", "pt-BR"
+    const prompt = `You are a professional technical translator specializing in residential maintenance and building trades.
+Translate the following JSON content into the language identified by locale code "${langName}".
+Preserve all JSON keys exactly as-is. Only translate the string values.
+Maintain technical accuracy — use proper maintenance and trades terminology in the target language.
+Return ONLY valid JSON with no additional text or markdown.
+
+Content to translate:
+${JSON.stringify(content, null, 2)}`;
+
+    const result = await model.generateContent(prompt);
+    const text = result.response.text().trim();
+
+    // Strip markdown code fences if present
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+
+    let translated;
+    try {
+      translated = JSON.parse(cleaned);
+    } catch {
+      // If parsing fails, return original with a warning
+      console.warn('[certifications/translate] JSON parse failed, returning original');
+      return res.json({ success: true, translated: content, warning: 'Translation parse failed, returned original' });
+    }
+
+    return res.json({ success: true, translated });
+  } catch (err) {
+    return handleError(res, err, 'POST /translate');
   }
 });
 
