@@ -1606,6 +1606,51 @@ app.post('/api/auth/send-verification-email', async (req, res) => {
 });
 
 // ─── Resend Verification Email (bypass missing Supabase RPC) ─────────────────
+// POST /api/auth/verify-email — verify token from email link
+app.post('/api/auth/verify-email', async (req, res) => {
+  try {
+    const { token, userId } = req.body;
+    if (!token) return res.status(400).json({ success: false, error: 'token is required' });
+
+    const sb = require('./lib/supabase');
+    const query = sb.from('profiles').select('id, verification_token, verification_token_expires_at, email_verified');
+    const { data: profile, error } = userId
+      ? await query.eq('id', userId).maybeSingle()
+      : await query.eq('verification_token', token).maybeSingle();
+
+    if (error) throw error;
+    if (!profile) return res.status(404).json({ success: false, error: 'User not found' });
+    if (profile.email_verified) return res.json({ success: true, alreadyVerified: true });
+
+    // Check token match
+    if (profile.verification_token !== token) {
+      return res.status(400).json({ success: false, error: 'Invalid verification token' });
+    }
+
+    // Check expiry
+    if (profile.verification_token_expires_at && new Date(profile.verification_token_expires_at) < new Date()) {
+      return res.status(400).json({ success: false, error: 'Verification link has expired. Please request a new one.' });
+    }
+
+    // Mark verified
+    const { error: updateError } = await sb.from('profiles').update({
+      email_verified: true,
+      email_verified_at: new Date().toISOString(),
+      verification_token: null,
+      verification_token_expires_at: null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', profile.id);
+
+    if (updateError) throw updateError;
+
+    console.log(`[auth] Email verified for user ${profile.id}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[auth] verify-email error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post('/api/auth/resend-verification', async (req, res) => {
   try {
     const { userId, userEmail, userName } = req.body;
