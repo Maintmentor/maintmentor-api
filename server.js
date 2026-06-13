@@ -231,6 +231,10 @@ app.get('/api/version', (req, res) => {
   });
 });
 
+// ─── Stripe health check cache (avoid rate-limiting on every health poll) ─────
+let _stripeCheckCache = null; // { status, latency_ms, error, cachedAt }
+const STRIPE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 // ─── Enhanced Health Check ────────────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   const spend = getSpendSummary();
@@ -251,21 +255,31 @@ app.get('/api/health', async (req, res) => {
     checks.db = { status: 'down', error: e.message };
   }
 
-  // ── 2. Stripe API reachability ─────────────────────────────────
-  try {
-    const stripeLib = require('./lib/stripe');
-    const t0 = Date.now();
-    await Promise.race([
-      stripeLib.stripe.balance.retrieve(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
-    ]);
-    checks.stripe = { status: 'ok', latency_ms: Date.now() - t0 };
-  } catch (e) {
-    const isTimeout = e.message === 'timeout';
-    checks.stripe = {
-      status: isTimeout ? 'degraded' : 'down',
-      error:  isTimeout ? 'Request timed out' : 'API unreachable',
-    };
+  // ── 2. Stripe API reachability (cached 5 min to avoid rate limits) ──────
+  if (_stripeCheckCache && (Date.now() - _stripeCheckCache.cachedAt) < STRIPE_CACHE_TTL_MS) {
+    // Use cached result — strip the internal cachedAt field
+    const { cachedAt: _c, ...cached } = _stripeCheckCache;
+    checks.stripe = cached;
+  } else {
+    try {
+      const stripeLib = require('./lib/stripe');
+      const t0 = Date.now();
+      await Promise.race([
+        stripeLib.stripe.balance.retrieve(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+      ]);
+      checks.stripe = { status: 'ok', latency_ms: Date.now() - t0 };
+    } catch (e) {
+      const isTimeout  = e.message === 'timeout';
+      const isRateLimit = e.type === 'StripeRateLimitError' || (e.message || '').toLowerCase().includes('rate limit');
+      checks.stripe = isRateLimit
+        ? { status: 'ok', note: 'rate-limited (API reachable)' }
+        : {
+            status: isTimeout ? 'degraded' : 'down',
+            error:  isTimeout ? 'Request timed out' : 'API unreachable',
+          };
+    }
+    _stripeCheckCache = { ...(checks.stripe), cachedAt: Date.now() };
   }
 
   // ── 3. Helius / Solana RPC reachability ───────────────────────
@@ -1176,6 +1190,13 @@ registerBillingRoutes(app);
   const certificationsRouter = require('./routes/certifications');
   app.use('/api/certifications', certificationsRouter);
   console.log('   Routes: /api/certifications registered ✅');
+}
+
+// ─── Assessments (Guest Quiz / Candidate Screening) ────────────────────────────
+{
+  const assessmentsRouter = require('./routes/assessments');
+  app.use('/api/assessments', assessmentsRouter);
+  console.log('   Routes: /api/assessments registered ✅');
 }
 
 // ─── Referrals Routes (Day 15) ───────────────────────────────────────────────

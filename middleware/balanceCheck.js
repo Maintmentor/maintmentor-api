@@ -90,11 +90,11 @@ async function balanceCheck(req, res, next) {
     return next();
   }
 
-  // balance_usd is treated as credits in the agent API context.
+  // balance_credits is treated as credits in the agent API context.
   // Future: migrate to a dedicated balance_credits column.
-  const currentBalance = typeof wallet.balance_usd === 'number'
-    ? wallet.balance_usd
-    : parseFloat(wallet.balance_usd) || 0;
+  const currentBalance = typeof wallet.balance_credits === 'number'
+    ? wallet.balance_credits
+    : parseFloat(wallet.balance_credits) || 0;
 
   if (currentBalance < creditCost) {
     return res.status(402).json({

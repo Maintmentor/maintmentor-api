@@ -147,7 +147,7 @@ async function requireApiKey(req, res, next) {
     // Load associated wallet
     const { data: wallet, error: walletError } = await supabase
       .from('wallets')
-      .select('id, user_id, balance_usd, lifetime_queries, lifetime_spend_usd')
+      .select('id, user_id, balance_credits, lifetime_credits, lifetime_spent')
       .eq('user_id', apiKey.user_id)
       .single();
 

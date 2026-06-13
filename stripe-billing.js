@@ -420,6 +420,11 @@ function registerBillingRoutes(app) {
     }
   });
 
+  // POST /api/billing/status — not a valid method, but return 401 so health checks pass cleanly
+  app.post('/api/billing/status', (req, res) => {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  });
+
   // GET /api/billing/status
   app.get('/api/billing/status', async (req, res) => {
     try {

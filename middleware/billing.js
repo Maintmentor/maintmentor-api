@@ -126,7 +126,7 @@ async function _processCharge(req, res, startTime) {
       // RPC not deployed yet — use direct read-modify-write fallback
       const { data: freshWallet, error: readError } = await supabase
         .from('wallets')
-        .select('balance_usd, lifetime_spend_usd')
+        .select('balance_credits, lifetime_spent')
         .eq('id', wallet.id)
         .single();
 
@@ -134,17 +134,17 @@ async function _processCharge(req, res, startTime) {
         throw new Error(`Could not read wallet for debit: ${readError?.message}`);
       }
 
-      const newBalance = Math.max(0, parseFloat(freshWallet.balance_usd) - creditCost);
-      const newLifetimeSpend = (parseFloat(freshWallet.lifetime_spend_usd) || 0) + creditCost;
+      const newBalance = Math.max(0, parseFloat(freshWallet.balance_credits) - creditCost);
+      const newLifetimeSpend = (parseFloat(freshWallet.lifetime_spent) || 0) + creditCost;
 
       const { error: updateError } = await supabase
         .from('wallets')
         .update({
-          balance_usd: newBalance,
-          lifetime_spend_usd: newLifetimeSpend,
+          balance_credits: newBalance,
+          lifetime_spent: newLifetimeSpend,
         })
         .eq('id', wallet.id)
-        .gte('balance_usd', creditCost); // Safety guard: only update if still sufficient
+        .gte('balance_credits', creditCost); // Safety guard: only update if still sufficient
 
       if (updateError) {
         throw new Error(`Wallet debit UPDATE failed: ${updateError.message}`);

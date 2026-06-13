@@ -45,6 +45,23 @@ const MAX_PHOTO_OUTPUT_TOKENS = 2000; // Photos warrant longer analysis
 const MAX_IMAGES_PER_REQUEST = 5;
 const MAX_QUESTION_LENGTH = 2000;
 
+// ─── Trade Category Classifier ──────────────────────────────────────────────────
+/**
+ * Classifies a maintenance question into a trade category for AI training data.
+ * @param {string} question
+ * @returns {'HVAC'|'Electrical'|'Plumbing'|'Structural'|'General'}
+ */
+function classifyTrade(question) {
+  if (!question) return 'General';
+  const q = question.toLowerCase();
+  if (/hvac|heat|cool|ac\b|furnace|duct|refriger|compressor|thermostat|air handler|condenser|evaporator|blower|filter|tonnage|btu|eer|seer/.test(q)) return 'HVAC';
+  if (/electric|outlet|breaker|panel|wire|circuit|gfci|voltage|amp|watt|neutral|ground|switch|receptacle|conduit|romex|arc fault/.test(q)) return 'Electrical';
+  if (/plumb|pipe|drain|leak|faucet|toilet|water heater|sewer|clog|septic|valve|supply line|p-trap|flapper|fill valve|shut.?off/.test(q)) return 'Plumbing';
+  if (/roof|foundation|wall|floor|ceiling|struct|crack|settle|beam|joist|rafter|sheathing|framing|stucco|masonry|slab/.test(q)) return 'Structural';
+  if (/paint|door|window|lock|cabinet|appliance|caulk|weatherstrip|drywall|tile|grout|carpet|hardwood/.test(q)) return 'General';
+  return 'General';
+}
+
 // ─── System Prompt (agent-specific, condensed) ────────────────────────────────
 const AGENT_SYSTEM_PROMPT = `You are MaintMentor, an expert residential maintenance AI with deep knowledge of HVAC, plumbing, electrical, and general contracting. Provide accurate, safe, actionable maintenance guidance. Always note when professional help is required.
 
@@ -202,7 +219,7 @@ ${fullQuestion}`;
       // Note: billing middleware will deduct after response is sent.
       // We optimistically subtract for the response.
       const { wallet, apiKey, creditCost } = req.apiContext;
-      const currentBalance = parseFloat(wallet.balance_usd) || 0;
+      const currentBalance = parseFloat(wallet.balance_credits) || 0;
       const projectedBalance = Math.max(0, currentBalance - creditCost);
 
       // ─── Attach billing metadata (fire-and-forget by billing middleware) ──
@@ -227,15 +244,16 @@ ${fullQuestion}`;
         supabase
           .from('query_history')
           .insert({
-            account_id: apiKey.user_id,
+            account_id:     apiKey.user_id,
             question,
-            context: context || null,
-            ai_answer: answer,
-            model_used: AGENT_MODEL,
-            tokens_input: tokensInput,
-            tokens_output: tokensOutput,
-            latency_ms: latencyMs,
-            source: 'agent_api',
+            context:        context || null,
+            ai_answer:      answer,
+            model_used:     AGENT_MODEL,
+            tokens_input:   tokensInput,
+            tokens_output:  tokensOutput,
+            latency_ms:     latencyMs,
+            source:         'agent_api',
+            trade_category: classifyTrade(question),
           })
           .then(({ error }) => {
             if (error) {
@@ -368,11 +386,11 @@ router.get(
       // Refresh wallet from DB to get latest balance
       const { data: freshWallet } = await supabase
         .from('wallets')
-        .select('balance_usd')
+        .select('balance_credits')
         .eq('id', wallet.id)
         .single();
 
-      const balanceCredits = parseFloat(freshWallet?.balance_usd ?? wallet.balance_usd) || 0;
+      const balanceCredits = parseFloat(freshWallet?.balance_credits ?? wallet.balance_credits) || 0;
 
       return res.json({
         wallet: {
@@ -662,7 +680,7 @@ router.post(
 
       // ─── Wallet balance (optimistic post-deduction) ────────────────────────
       const { wallet, apiKey, creditCost } = req.apiContext;
-      const currentBalance  = parseFloat(wallet.balance_usd) || 0;
+      const currentBalance  = parseFloat(wallet.balance_credits) || 0;
       const projectedBalance = Math.max(0, currentBalance - creditCost);
 
       // ─── Attach billing metadata ───────────────────────────────────────────
@@ -684,15 +702,16 @@ router.post(
         supabase
           .from('query_history')
           .insert({
-            account_id:   apiKey.user_id,
-            question:     question || '(photo analysis)',
-            context:      { image_count: images.length },
-            ai_answer:    analysis,
-            model_used:   AGENT_MODEL_PRO,
-            tokens_input: tokensInput,
-            tokens_output: tokensOutput,
-            latency_ms:   latencyMs,
-            source:       'agent_api_photo',
+            account_id:     apiKey.user_id,
+            question:       question || '(photo analysis)',
+            context:        { image_count: images.length },
+            ai_answer:      analysis,
+            model_used:     AGENT_MODEL_PRO,
+            tokens_input:   tokensInput,
+            tokens_output:  tokensOutput,
+            latency_ms:     latencyMs,
+            source:         'agent_api_photo',
+            trade_category: classifyTrade(question || ''),
           })
           .then(({ error }) => {
             if (error) {
@@ -777,12 +796,12 @@ router.post(
     const isEmergency = urgencyLevel === 'emergency';
 
     if (!isEmergency) {
-      const balance = parseFloat(wallet?.balance_usd) || 0;
+      const balance = parseFloat(wallet?.balance_credits) || 0;
       if (balance < CREDIT_COST * 0.01) {
         return res.status(402).json({
           error: 'Insufficient credits',
           code:  'INSUFFICIENT_CREDITS',
-          balance_usd: balance,
+          balance_credits: balance,
           required_credits: CREDIT_COST,
         });
       }
@@ -851,14 +870,15 @@ router.post(
       // Log to query_history (async)
       setImmediate(() => {
         supabase.from('query_history').insert({
-          account_id:    apiKey?.user_id,
-          question:      fullPrompt,
-          ai_answer:     parsed.answer || rawText,
-          model_used:    selectedModel,
-          tokens_input:  tokensInput,
-          tokens_output: tokensOutput,
-          latency_ms:    latencyMs,
-          source:        'agent_field',
+          account_id:     apiKey?.user_id,
+          question:       fullPrompt,
+          ai_answer:      parsed.answer || rawText,
+          model_used:     selectedModel,
+          tokens_input:   tokensInput,
+          tokens_output:  tokensOutput,
+          latency_ms:     latencyMs,
+          source:         'agent_field',
+          trade_category: classifyTrade(fullPrompt),
           context: {
             location, equipment_type, urgency: urgencyLevel,
             emergency: isEmergency,
