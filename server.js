@@ -1320,6 +1320,13 @@ registerBillingRoutes(app);
 }
 
 // ─── Start Server ──────────────────────────────────────────────────────────────
+// IoT Routes
+{
+  const iotRouter = require('./routes/iot');
+  app.use('/api/iot', iotRouter);
+  console.log('   Routes: /api/iot registered');
+}
+
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 app.listen(PORT, HOST, async () => {
   logger.info({ port: PORT, env: process.env.NODE_ENV || 'development' }, 'MaintMentor API started');
