@@ -17,6 +17,7 @@
     "express-rate-limit": "^8.5.2",
     "google-img-scrap": "^1.1.8",
     "js-yaml": "^4.2.0",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.21.0",
     "pino": "^10.3.1",
     "pino-pretty": "^13.1.3",

@@ -30,6 +30,7 @@ const { balanceCheck } = require('../middleware/balanceCheck');
 const { billing } = require('../middleware/billing');
 const { agentApiLimiter, photoLimiter } = require('../middleware/rateLimiter');
 const { buildRagContext, queueForEmbedding, processEmbeddingQueue } = require('../lib/embeddings');
+const { buildManualContext } = require('../lib/manuals');
 
 // ─── Gemini Client ─────────────────────────────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -187,10 +188,20 @@ router.post(
         console.warn('[agent/query] RAG lookup threw unexpectedly — skipping:', _ragErr.message);
       }
 
-      // Prepend RAG context to the question if we found relevant past answers
+      // ─── Manual Knowledge Base Lookup (< 300ms, skipped on timeout/error) ──
+      // Full-text search over uploaded maintenance manuals.
+      let manualContext = null;
+      try {
+        manualContext = await buildManualContext(question);
+      } catch (_manErr) {
+        console.warn('[agent/query] Manual lookup threw unexpectedly — skipping:', _manErr.message);
+      }
+
+      // Prepend RAG + manual context to the question if we found relevant content
       let promptText = fullQuestion;
-      if (ragContext) {
-        promptText = `${ragContext}
+      const contextBlocks = [ragContext, manualContext].filter(Boolean);
+      if (contextBlocks.length > 0) {
+        promptText = `${contextBlocks.join('\n\n')}
 
 ${fullQuestion}`;
       }
@@ -235,6 +246,7 @@ ${fullQuestion}`;
           has_context: !!(context && typeof context === 'object'),
           question_length: question.length,
           rag_injected: !!ragContext,
+          manual_injected: !!manualContext,
           // NO question text — could contain PII
         },
       };
