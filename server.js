@@ -1410,6 +1410,16 @@ const BLOCKED_IMAGE_DOMAINS = [
   'alamy.com', 'dreamstime.com', '123rf.com',
   'facebook.com', 'fbcdn.net', 'instagram.com',
   'tiktok.com', 'twitter.com', 'x.com',
+  // Low-quality / unrelated diagram sources
+  'blogspot.com', 'schematron.org', 'alicdn.com', 'alibaba.com',
+  'researchgate.net', 'academia.edu', 'dhiasite', 'reviewmotors.co',
+  'circuitblaze.com', 'wiring-diagram', 'wiringdiagram', 'diagramsite',
+  'amazon.com', 'ebay.com', 'walmart.com', 'etsy.com',
+  // Cloud storage buckets used to host random blog/spam content
+  'storage.googleapis.com', 'blob.core.windows.net', 'web.core.windows.net',
+  'cloudfront.net', 's3.amazonaws.com',
+  // Misc junk
+  'detoxicrecenze.com', 'wixsite.com', 'weebly.com', 'squarespace.com',
 ];
 
 // Allowed image domains for diagrams/parts (prioritized)
@@ -1490,11 +1500,21 @@ app.get('/api/diagrams/search', async (req, res) => {
     console.log(`[diagrams] Searching Bing Images: ${query}`);
     const images = await searchBingImages(query, 15);
 
-    // Cache the results
-    diagramCache.set(cacheKey, { images, timestamp: Date.now() });
+    // Sort: trusted domains first, then others
+    const trusted = images.filter(img =>
+      TRUSTED_DIAGRAM_DOMAINS.some(d => (img.imageUrl + img.contextUrl).toLowerCase().includes(d))
+    );
+    const others = images.filter(img =>
+      !TRUSTED_DIAGRAM_DOMAINS.some(d => (img.imageUrl + img.contextUrl).toLowerCase().includes(d))
+    );
+    // If we have 3+ trusted results, only return trusted — no junk mixed in
+    const sortedImages = trusted.length >= 3 ? trusted : [...trusted, ...others];
 
-    console.log(`[diagrams] Found ${images.length} images for ${modelNumber}`);
-    res.json({ success: true, modelNumber, query, fromCache: false, count: images.length, images });
+    // Cache the sorted results
+    diagramCache.set(cacheKey, { images: sortedImages, timestamp: Date.now() });
+
+    console.log(`[diagrams] Found ${sortedImages.length} images for ${modelNumber} (${trusted.length} trusted)`);
+    res.json({ success: true, modelNumber, query, fromCache: false, count: sortedImages.length, images: sortedImages });
   } catch (err) {
     console.error(`[diagrams] Search error for ${modelNumber}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
