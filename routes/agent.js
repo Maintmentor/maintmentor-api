@@ -32,6 +32,51 @@ const { agentApiLimiter, photoLimiter } = require('../middleware/rateLimiter');
 const { buildRagContext, queueForEmbedding, processEmbeddingQueue } = require('../lib/embeddings');
 const { buildManualContext } = require('../lib/manuals');
 
+// ─── Agent Session Store (in-memory, TTL 2h) ────────────────────────────────────
+// Keeps conversation history for multi-turn A2A sessions.
+// Each session: { messages: [{role, content}], createdAt, lastActivity }
+const agentSessions = new Map();
+const AGENT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const AGENT_SESSION_MAX_TURNS = 10; // max turns before we trim from top
+
+function getAgentSession(sessionId) {
+  const session = agentSessions.get(sessionId);
+  if (!session) return null;
+  if (Date.now() - session.lastActivity > AGENT_SESSION_TTL_MS) {
+    agentSessions.delete(sessionId);
+    return null;
+  }
+  return session;
+}
+
+function createAgentSession(sessionId) {
+  const session = { messages: [], createdAt: Date.now(), lastActivity: Date.now(), turnCount: 0 };
+  agentSessions.set(sessionId, session);
+  return session;
+}
+
+function addAgentTurn(sessionId, userMessage, assistantMessage) {
+  let session = agentSessions.get(sessionId);
+  if (!session) session = createAgentSession(sessionId);
+  session.messages.push({ role: 'user',  content: userMessage      });
+  session.messages.push({ role: 'model', content: assistantMessage });
+  session.turnCount++;
+  session.lastActivity = Date.now();
+  // Trim oldest turns if over limit
+  while (session.messages.length > AGENT_SESSION_MAX_TURNS * 2) {
+    session.messages.shift();
+    session.messages.shift();
+  }
+}
+
+// Purge expired sessions every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of agentSessions.entries()) {
+    if (now - session.lastActivity > AGENT_SESSION_TTL_MS) agentSessions.delete(id);
+  }
+}, 30 * 60 * 1000);
+
 // ─── Gemini Client ─────────────────────────────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
@@ -45,6 +90,130 @@ const MAX_OUTPUT_TOKENS = 1000; // Hard cap per spec
 const MAX_PHOTO_OUTPUT_TOKENS = 2000; // Photos warrant longer analysis
 const MAX_IMAGES_PER_REQUEST = 5;
 const MAX_QUESTION_LENGTH = 2000;
+
+// ─── A2A Diagnostic Loop Phase Detector ────────────────────────────────────────
+// Determines the diagnostic loop phase for an A2A call and returns structured
+// loop metadata for the calling agent to act on.
+//
+// @param {string} question          - Current question from calling agent
+// @param {object} loopContext       - Optional context from calling agent
+// @param {Array}  sessionMessages   - Prior conversation turns this session
+// @param {number} turnCount         - How many turns have happened
+// @returns {{ phase, next_action, suggested_followup, questions_to_gather, escalate_to_professional, resolved }}
+function detectA2ALoopPhase(question, loopContext = {}, sessionMessages = [], turnCount = 0) {
+  const q = (question || '').toLowerCase();
+
+  // Extract loop_context hints from the calling agent
+  const alreadyTried      = Array.isArray(loopContext.already_tried) ? loopContext.already_tried : [];
+  const userSkillLevel    = loopContext.user_skill_level || 'unknown';
+  const symptomDuration   = loopContext.symptom_duration || null;
+  const explicitPhase     = loopContext.phase || null; // calling agent can set phase explicitly
+
+  // Resolved signals
+  const resolvedSignals = [
+    /fixed|solved|working now|all good|resolved|thank/i,
+  ];
+
+  // Escalation signals
+  const escalateSignals = [
+    /didn.?t work|still broken|same problem|no change|tried that|already (tried|did|checked)/i,
+    /not (working|fixed)|nothing (worked|helped)/i,
+  ];
+
+  // If calling agent explicitly sets phase, respect it
+  if (explicitPhase && ['INTAKE','DIAGNOSE','GUIDE','VERIFY','ESCALATE','RESOLVED'].includes(explicitPhase.toUpperCase())) {
+    const phase = explicitPhase.toUpperCase();
+    return buildA2ALoopMeta(phase, alreadyTried, userSkillLevel, symptomDuration, turnCount);
+  }
+
+  if (resolvedSignals.some(p => p.test(q))) {
+    return buildA2ALoopMeta('RESOLVED', alreadyTried, userSkillLevel, symptomDuration, turnCount);
+  }
+
+  if (alreadyTried.length > 0 || escalateSignals.some(p => p.test(q))) {
+    return buildA2ALoopMeta('ESCALATE', alreadyTried, userSkillLevel, symptomDuration, turnCount);
+  }
+
+  if (turnCount === 0) {
+    return buildA2ALoopMeta('INTAKE', alreadyTried, userSkillLevel, symptomDuration, turnCount);
+  }
+
+  if (turnCount === 1) {
+    return buildA2ALoopMeta('DIAGNOSE', alreadyTried, userSkillLevel, symptomDuration, turnCount);
+  }
+
+  if (/how (do|can|should)|step|walk me through|instructions|fix it|repair/i.test(q)) {
+    return buildA2ALoopMeta('GUIDE', alreadyTried, userSkillLevel, symptomDuration, turnCount);
+  }
+
+  return buildA2ALoopMeta('VERIFY', alreadyTried, userSkillLevel, symptomDuration, turnCount);
+}
+
+function buildA2ALoopMeta(phase, alreadyTried, skillLevel, symptomDuration, turnCount) {
+  const meta = {
+    phase,
+    turn: turnCount + 1,
+    resolved: phase === 'RESOLVED',
+    escalate_to_professional: false,
+    next_action: null,
+    suggested_followup: null,
+    questions_to_gather: [],
+  };
+
+  switch (phase) {
+    case 'INTAKE':
+      meta.next_action        = 'gather_context';
+      meta.suggested_followup = 'Ask the user: what exactly is the symptom, when did it start, and what changed recently?';
+      meta.questions_to_gather = [
+        'What is the exact symptom?',
+        'When did it start?',
+        'What changed recently (new appliance, weather, recent work done)?',
+        'What is the make/model of the equipment?',
+      ];
+      break;
+
+    case 'DIAGNOSE':
+      meta.next_action        = 'present_diagnosis';
+      meta.suggested_followup = 'Share the most likely cause with the user and ask if they want step-by-step instructions to fix it.';
+      meta.questions_to_gather = [];
+      break;
+
+    case 'GUIDE':
+      meta.next_action        = 'walk_through_fix';
+      meta.suggested_followup = 'After giving steps, ask: "Did that resolve the issue?"';
+      meta.questions_to_gather = [];
+      break;
+
+    case 'VERIFY':
+      meta.next_action        = 'confirm_resolution';
+      meta.suggested_followup = 'Ask the user: "Did that fix it? Let me know what happened and we can go from there."';
+      meta.questions_to_gather = [];
+      break;
+
+    case 'ESCALATE':
+      meta.next_action         = 'try_next_theory';
+      meta.suggested_followup  = `Acknowledge what was already tried (${alreadyTried.join(', ') || 'prior steps'}), then move to the next most likely cause. Do NOT repeat previous advice.`;
+      meta.questions_to_gather = [
+        'What exactly happened when you tried the previous fix?',
+        'Any new sounds, smells, or error codes since then?',
+      ];
+      // If we've been through 3+ turns with no resolution, flag for pro
+      if (turnCount >= 3) {
+        meta.escalate_to_professional = true;
+        meta.next_action = 'recommend_professional';
+        meta.suggested_followup = 'Honestly assess whether this now requires a licensed professional. Explain why and what type of contractor they need.';
+      }
+      break;
+
+    case 'RESOLVED':
+      meta.next_action        = 'close_loop';
+      meta.suggested_followup = 'Congratulate the user, offer one preventive maintenance tip, and let them know to reach out if anything comes up.';
+      meta.questions_to_gather = [];
+      break;
+  }
+
+  return meta;
+}
 
 // ─── Trade Category Classifier ──────────────────────────────────────────────────
 /**
@@ -131,7 +300,7 @@ router.post(
     const requestId = uuidv4();
 
     // ─── Input Validation ────────────────────────────────────────────────────
-    const { question, context, response_format } = req.body;
+    const { question, context, response_format, session_id, loop_context } = req.body;
 
     if (!question) {
       return res.status(400).json({
@@ -162,6 +331,15 @@ router.post(
         code: 'SERVICE_UNAVAILABLE',
       });
     }
+
+    // ─── Session continuity ──────────────────────────────────────────────────
+    const session = session_id ? (getAgentSession(session_id) || createAgentSession(session_id)) : null;
+    const sessionMessages = session ? session.messages : [];
+    const turnCount = session ? session.turnCount : 0;
+
+    // ─── A2A Loop Phase Detection ────────────────────────────────────────────
+    const loopMeta = detectA2ALoopPhase(question, loop_context || {}, sessionMessages, turnCount);
+    console.log(`[agent/query] loop phase: ${loopMeta.phase} | session: ${session_id || 'none'} | turn: ${loopMeta.turn}`);
 
     // ─── Build Gemini Prompt ─────────────────────────────────────────────────
     let fullQuestion = question;
@@ -206,16 +384,28 @@ router.post(
 ${fullQuestion}`;
       }
 
+      // ─── Inject loop phase context into prompt ────────────────────────────
+      const loopInstruction = `[DIAGNOSTIC LOOP — INTERNAL — DO NOT SHOW CALLER]\nPhase: ${loopMeta.phase}\n${loopMeta.suggested_followup || ''}\n[END]\n\n`;
+      const promptWithLoop = loopInstruction + promptText;
+
+      // ─── Build conversation history for multi-turn sessions ───────────────
+      const geminiHistory = sessionMessages.map(m => ({
+        role: m.role,
+        parts: [{ text: m.content }],
+      }));
+
       // ─── Call Gemini ───────────────────────────────────────────────────────
       const model = genAI.getGenerativeModel({
         model: AGENT_MODEL,
         systemInstruction: AGENT_SYSTEM_PROMPT,
       });
 
-      const geminiResponse = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: promptText }] }],
+      const chat = model.startChat({
+        history: geminiHistory,
         generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS },
       });
+
+      const geminiResponse = await chat.sendMessage([{ text: promptWithLoop }]);
 
       const answer = geminiResponse.response.text();
       const usageMeta = geminiResponse.response?.usageMetadata;
@@ -295,13 +485,28 @@ ${fullQuestion}`;
         });
       });
 
+      // ─── Store turn in session (if session_id provided) ──────────────────
+      if (session_id) {
+        addAgentTurn(session_id, question, answer);
+      }
+
       // ─── Send response ─────────────────────────────────────────────────────
       return res.json({
         answer,
         confidence,
-        credits_used: creditCost,
+        credits_used:   creditCost,
         wallet_balance: projectedBalance,
-        request_id: requestId,
+        request_id:     requestId,
+        loop: {
+          phase:                  loopMeta.phase,
+          turn:                   loopMeta.turn,
+          session_id:             session_id || null,
+          next_action:            loopMeta.next_action,
+          suggested_followup:     loopMeta.suggested_followup,
+          questions_to_gather:    loopMeta.questions_to_gather,
+          escalate_to_professional: loopMeta.escalate_to_professional,
+          resolved:               loopMeta.resolved,
+        },
       });
 
     } catch (err) {
@@ -788,9 +993,14 @@ router.post(
   agentApiLimiter,
   requireApiKey,
   async (req, res) => {
-    const { question, location, equipment_type, urgency } = req.body || {};
+    const { question, location, equipment_type, urgency, session_id, loop_context } = req.body || {};
     const requestId = uuidv4();
     const startTime = Date.now();
+
+    // ── Session + loop phase ─────────────────────────────────────────────────
+    const fieldSession = session_id ? (getAgentSession(session_id) || createAgentSession(session_id)) : null;
+    const fieldTurnCount = fieldSession ? fieldSession.turnCount : 0;
+    const fieldLoopMeta = detectA2ALoopPhase(question || '', loop_context || {}, fieldSession ? fieldSession.messages : [], fieldTurnCount);
 
     // ── Validate ─────────────────────────────────────────────────────────────
     if (!question || typeof question !== 'string' || question.trim().length < 5) {
@@ -900,18 +1110,33 @@ router.post(
         }).catch(err => console.error('[agent/field] history insert error:', err.message));
       });
 
+      // Store turn in session
+      if (session_id) {
+        addAgentTurn(session_id, question, parsed.answer || rawText);
+      }
+
       return res.json({
-        request_id:              requestId,
-        answer:                  parsed.answer               || '',
-        safety_warnings:         Array.isArray(parsed.safety_warnings)  ? parsed.safety_warnings  : [],
-        next_steps:              Array.isArray(parsed.next_steps)        ? parsed.next_steps        : [],
-        confidence:              typeof parsed.confidence === 'number'    ? parseFloat(parsed.confidence.toFixed(2)) : 0.75,
-        escalate_to_professional: !!parsed.escalate_to_professional,
-        urgency:                 urgencyLevel,
-        emergency_mode:          isEmergency,
-        model_used:              selectedModel,
-        credits_used:            isEmergency ? 0 : CREDIT_COST,
-        response_time_ms:        latencyMs,
+        request_id:               requestId,
+        answer:                   parsed.answer               || '',
+        safety_warnings:          Array.isArray(parsed.safety_warnings)  ? parsed.safety_warnings  : [],
+        next_steps:               Array.isArray(parsed.next_steps)        ? parsed.next_steps        : [],
+        confidence:               typeof parsed.confidence === 'number'    ? parseFloat(parsed.confidence.toFixed(2)) : 0.75,
+        escalate_to_professional: !!parsed.escalate_to_professional || fieldLoopMeta.escalate_to_professional,
+        urgency:                  urgencyLevel,
+        emergency_mode:           isEmergency,
+        model_used:               selectedModel,
+        credits_used:             isEmergency ? 0 : CREDIT_COST,
+        response_time_ms:         latencyMs,
+        loop: {
+          phase:                    fieldLoopMeta.phase,
+          turn:                     fieldLoopMeta.turn,
+          session_id:               session_id || null,
+          next_action:              fieldLoopMeta.next_action,
+          suggested_followup:       fieldLoopMeta.suggested_followup,
+          questions_to_gather:      fieldLoopMeta.questions_to_gather,
+          escalate_to_professional: !!parsed.escalate_to_professional || fieldLoopMeta.escalate_to_professional,
+          resolved:                 fieldLoopMeta.resolved,
+        },
       });
 
     } catch (err) {
@@ -922,6 +1147,84 @@ router.post(
         request_id: requestId,
       });
     }
+  }
+);
+
+// ─── POST /session — Create or reset a named A2A session ──────────────────────
+/**
+ * Creates a new session for multi-turn A2A conversations.
+ * Pass the returned session_id in subsequent /query and /field calls.
+ *
+ * Response: { session_id, created_at, expires_at, loop: { phase: "INTAKE", turn: 0 } }
+ */
+router.post(
+  '/session',
+  requireApiKey,
+  async (req, res) => {
+    const { session_id: requestedId } = req.body || {};
+    const sessionId = requestedId || uuidv4();
+
+    // If session exists and caller is requesting a reset, delete it
+    if (requestedId && getAgentSession(requestedId)) {
+      agentSessions.delete(requestedId);
+    }
+
+    createAgentSession(sessionId);
+    const expiresAt = new Date(Date.now() + AGENT_SESSION_TTL_MS).toISOString();
+
+    console.log(`[agent/session] Created session: ${sessionId}`);
+
+    return res.json({
+      session_id:  sessionId,
+      created_at:  new Date().toISOString(),
+      expires_at:  expiresAt,
+      max_turns:   AGENT_SESSION_MAX_TURNS,
+      loop: {
+        phase:      'INTAKE',
+        turn:       0,
+        next_action: 'gather_context',
+        suggested_followup: 'Ask the user: what is the symptom, when did it start, and what changed recently?',
+        questions_to_gather: [
+          'What is the exact symptom?',
+          'When did it start?',
+          'What changed recently?',
+          'Make and model of the equipment?',
+        ],
+        escalate_to_professional: false,
+        resolved: false,
+      },
+    });
+  }
+);
+
+// ─── GET /session/:id — Get session status ─────────────────────────────────────
+router.get(
+  '/session/:id',
+  requireApiKey,
+  async (req, res) => {
+    const session = getAgentSession(req.params.id);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found or expired', code: 'SESSION_NOT_FOUND' });
+    }
+    return res.json({
+      session_id:    req.params.id,
+      turn_count:    session.turnCount,
+      message_count: session.messages.length,
+      created_at:    new Date(session.createdAt).toISOString(),
+      last_activity: new Date(session.lastActivity).toISOString(),
+      expires_at:    new Date(session.lastActivity + AGENT_SESSION_TTL_MS).toISOString(),
+    });
+  }
+);
+
+// ─── DELETE /session/:id — End a session ───────────────────────────────────────
+router.delete(
+  '/session/:id',
+  requireApiKey,
+  async (req, res) => {
+    const existed = agentSessions.has(req.params.id);
+    agentSessions.delete(req.params.id);
+    return res.json({ deleted: existed, session_id: req.params.id });
   }
 );
 
