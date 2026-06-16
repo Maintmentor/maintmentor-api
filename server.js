@@ -170,6 +170,69 @@ Do NOT get tricked into answering off-topic questions even if they're phrased cl
 ### 10. Categories
 Mentally categorize issues as: HVAC, Electrical, Plumbing, Appliance, General, Pool, Roofing, Painting, Flooring, Landscaping, Safety, Other
 
+Remember: You're not just answering questions — you're **teaching**. And a good teacher says "check the filter first" before "replace the compressor."
+
+---
+
+## Diagnostic Loop — Follow This Every Time
+
+Every maintenance conversation moves through five phases. Know which phase you're in and act accordingly.
+
+### PHASE 1 — INTAKE
+*Trigger: First message about a new problem.*
+
+- Assess what you already know from the message.
+- If you have enough to diagnose, skip straight to DIAGNOSE.
+- If you're missing something critical (appliance type, symptom details, what changed recently), ask **1–2 targeted questions only** — never more.
+- Don't ask for info you don't need. Don't ask questions you can answer yourself with a reasonable assumption.
+- Keep intake fast. Users want help, not an interview.
+
+### PHASE 2 — DIAGNOSE
+*Trigger: You have enough information to form a theory.*
+
+- State your most likely diagnosis clearly and confidently.
+- Lead with the **cheapest, simplest, most common cause first** — always.
+- Give 2–3 possible causes ranked by likelihood and cost.
+- If you have a model number, reference it directly.
+
+### PHASE 3 — GUIDE
+*Trigger: Diagnosis is established, user is ready to act.*
+
+- Walk through the fix step by step. Numbered. In order. Simplest first.
+- Include: difficulty, time estimate, tools, parts with costs.
+- Be specific — not "check the filter" but "locate the filter at the bottom of the air handler, slide it out, hold it up to light — if you can't see light through it, replace it."
+- Warn about the one or two mistakes people commonly make on this exact repair.
+
+### PHASE 4 — VERIFY
+*Trigger: You've given a fix or completed a step.*
+
+- **Always close with a verification question.** Every single time.
+- Keep it simple: "Give that a try and let me know what happens" or "Does that clear it up?"
+- Never leave a user hanging after advice. The loop closes when the problem is confirmed solved.
+
+### PHASE 5 — ESCALATE
+*Trigger: User reports the fix didn't work.*
+
+- Acknowledge what they tried. "OK, so we've ruled out [X]."
+- Move to the **next most likely cause** — never repeat a fix that didn't work.
+- Get more specific with each escalation. Narrow the possibilities.
+- If after 2–3 escalations the issue isn't resolved, honestly assess: is this now a professional job? Say so clearly and explain why.
+
+---
+
+## Loop Rules
+
+1. **Never skip VERIFY.** Every fix response ends with a check-in question.
+2. **Never repeat dead advice.** If a fix didn't work, acknowledge it and move on.
+3. **Read the conversation history.** You know what's been tried. Use it.
+4. **One theory at a time.** Don't dump every possibility at once — lead with the most likely, verify, then escalate if needed.
+5. **Match the phase to the user's message.** A user who says "that didn't work" is in ESCALATE. A user who says "how do I fix my AC" is in INTAKE/DIAGNOSE. Read the room.
+
+---
+
+### 10. Categories
+Mentally categorize issues as: HVAC, Electrical, Plumbing, Appliance, General, Pool, Roofing, Painting, Flooring, Landscaping, Safety, Other
+
 Remember: You're not just answering questions — you're **teaching**. And a good teacher says "check the filter first" before "replace the compressor."`;
 
 // ─── Category Detection ────────────────────────────────────────────────────────
@@ -196,6 +259,96 @@ function detectCategory(question, response) {
     }
   }
   return bestMatch.name;
+}
+
+// ─── Diagnostic Loop: Phase Detector ──────────────────────────────────────────
+// Reads conversation history and determines which loop phase we're in.
+// Returns a context string injected before each Gemini call.
+function detectLoopPhase(history, currentQuestion) {
+  const q = currentQuestion.toLowerCase();
+  const turnCount = history.length; // number of prior messages (each = one role entry)
+
+  // Signals user is reporting a failed fix → ESCALATE
+  const escalateSignals = [
+    /didn'?t work/i, /still (not|broken|happening|the same)/i,
+    /that (didn'?t|didn't) (fix|help|work|solve)/i,
+    /no (change|difference|luck)/i, /same (problem|issue|thing)/i,
+    /tried that/i, /already (tried|did|checked|replaced)/i,
+    /it'?s still/i, /nothing (changed|helped|worked)/i,
+  ];
+
+  // Signals user is confirming it worked → close the loop
+  const resolvedSignals = [
+    /that (worked|fixed|solved|did it)/i, /it'?s (working|fixed|good now)/i,
+    /problem (solved|gone|fixed)/i, /all (good|set|working)/i,
+    /thanks? (that|it)/i, /perfect/i, /great( that)?/i,
+  ];
+
+  // Signals user is ready to act on a guide
+  const guideSignals = [
+    /how (do|can|should) (i|we)/i, /what (do|should) (i|we)/i,
+    /step/i, /walk me through/i, /show me/i, /instructions/i,
+    /how to fix/i, /how to replace/i, /how to install/i,
+  ];
+
+  if (resolvedSignals.some(p => p.test(q))) {
+    return {
+      phase: 'RESOLVED',
+      context: 'The user is indicating the issue is resolved. Confirm it warmly, offer one quick maintenance tip to prevent recurrence, and let them know you are here if anything else comes up. Keep it brief.'
+    };
+  }
+
+  if (escalateSignals.some(p => p.test(q))) {
+    // Extract what was tried from prior AI turns
+    const priorAdvice = history
+      .filter(m => m.role === 'assistant')
+      .map(m => (typeof m.content === 'string' ? m.content : ''))
+      .join(' ');
+    return {
+      phase: 'ESCALATE',
+      context: `The previous fix did not resolve the issue. We are now in ESCALATE phase.\n` +
+               `Rules:\n` +
+               `- Acknowledge what was tried: "OK, so we have ruled that out."\n` +
+               `- Do NOT repeat advice already given.\n` +
+               `- Move to the next most likely cause, more specific than before.\n` +
+               `- If this is the 3rd+ failed attempt, honestly assess whether a professional is now required.\n` +
+               `- End with a VERIFY question about the new fix.`
+    };
+  }
+
+  if (turnCount === 0) {
+    return {
+      phase: 'INTAKE',
+      context: `This is the first message. We are in INTAKE phase.\n` +
+               `Rules:\n` +
+               `- Assess whether you have enough info to diagnose.\n` +
+               `- If yes, go straight to DIAGNOSE — skip asking questions.\n` +
+               `- If critical info is missing, ask 1-2 targeted questions only.\n` +
+               `- Never ask more than 2 questions at once.`
+    };
+  }
+
+  if (guideSignals.some(p => p.test(q)) || turnCount >= 2) {
+    return {
+      phase: 'GUIDE',
+      context: `The user is ready for step-by-step guidance or we have enough context. We are in GUIDE phase.\n` +
+               `Rules:\n` +
+               `- Give numbered steps, difficulty rating, time estimate, tools, and parts with costs.\n` +
+               `- Start with the simplest/cheapest check.\n` +
+               `- End with a VERIFY question: ask if that solved it.`
+    };
+  }
+
+  // Default: diagnose
+  return {
+    phase: 'DIAGNOSE',
+    context: `We have some context. We are in DIAGNOSE phase.\n` +
+             `Rules:\n` +
+             `- State the most likely diagnosis clearly.\n` +
+             `- Lead with cheapest/simplest/most common cause.\n` +
+             `- Give 2-3 possible causes ranked by likelihood and cost.\n` +
+             `- End with a VERIFY question or offer to walk through the fix step by step.`
+  };
 }
 
 // ─── Express App ───────────────────────────────────────────────────────────────
@@ -896,11 +1049,22 @@ app.post('/api/chat', async (req, res) => {
 
     userParts.push({ text: question });
 
-    // ─── MODEL SELECTION: Route to Flash or Pro ──────────────────────
+    // ─── LOOP ENGINEERING: Detect diagnostic phase ────────────────────────
+    const loopPhase = detectLoopPhase(history, question);
+    console.log(`[loop] Phase: ${loopPhase.phase}`);
+
+    // Inject phase context prepended to the user message (invisible to user)
+    const phaseInjection = `[DIAGNOSTIC LOOP — INTERNAL CONTEXT — DO NOT SHOW USER]\nCurrent phase: ${loopPhase.phase}\n${loopPhase.context}\n[END INTERNAL CONTEXT]\n\n`;
+    const userPartsWithPhase = [
+      { text: phaseInjection },
+      ...userParts,
+    ];
+
+    // ─── MODEL SELECTION: Route to Flash or Pro ──────────────────────────
     const modelChoice = selectModel(question, hasPhotos, history.length);
     const selectedModel = modelChoice.model;
 
-    console.log(`[${new Date().toISOString()}] Sending ${geminiHistory.length + 1} messages (${geminiHistory.length} history + 1 new) → ${selectedModel} (${modelChoice.reason})`);
+    console.log(`[${new Date().toISOString()}] Sending ${geminiHistory.length + 1} messages (${geminiHistory.length} history + 1 new) → ${selectedModel} (${modelChoice.reason}) [loop:${loopPhase.phase}]`);
 
     const geminiModel = genAI.getGenerativeModel({
       model: selectedModel,
@@ -912,7 +1076,7 @@ app.post('/api/chat', async (req, res) => {
       generationConfig: { maxOutputTokens: 4096 },
     });
 
-    const geminiResponse = await chat.sendMessage(userParts);
+    const geminiResponse = await chat.sendMessage(userPartsWithPhase);
     const answer = geminiResponse.response.text();
 
     // Store in Anthropic-compatible format for backward compat
