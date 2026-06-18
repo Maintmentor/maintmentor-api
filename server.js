@@ -1349,6 +1349,68 @@ registerBillingRoutes(app);
   console.log('   Routes: /api/agent registered ✅');
 }
 
+// ─── A2A Protocol (Agent2Agent) ───────────────────────────────────────────────
+// Agent Card: GET /.well-known/agent.json
+// A2A endpoint: POST /a2a  (JSON-RPC 2.0)
+{
+  const CLOUD_RUN_BASE = process.env.CLOUD_RUN_URL || 'https://maintmentor-api-878722550029.us-east1.run.app';
+  const agentCard = {
+    name: 'MaintMentor',
+    description: 'Expert residential maintenance AI — HVAC, plumbing, electrical, and general contracting. Powered by Google Gemini on Cloud Run.',
+    url: `${CLOUD_RUN_BASE}/a2a`,
+    iconUrl: 'https://maintmentor.ai/icons/maintmentor-logo.png',
+    version: '1.0.0',
+    documentationUrl: 'https://maintmentor.ai/developer',
+    provider: { organization: 'MaintMentor.ai', url: 'https://maintmentor.ai' },
+    capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
+    authentication: { schemes: ['bearer'], credentials: 'Obtain an API key at https://maintmentor.ai/developer' },
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
+    skills: [
+      {
+        id: 'maintenance-query',
+        name: 'Maintenance Query',
+        description: 'Answer text-based residential maintenance questions across all trades: HVAC, plumbing, electrical, appliances, and general contracting.',
+        tags: ['maintenance', 'HVAC', 'plumbing', 'electrical', 'DIY', 'repair'],
+        inputModes: ['text/plain'],
+        outputModes: ['text/plain'],
+        examples: ['Why is my AC not blowing cold air?', 'How do I fix a running toilet?'],
+      },
+      {
+        id: 'maintenance-photo',
+        name: 'Maintenance Photo Analysis',
+        description: 'Analyze photos of equipment or damage to identify maintenance issues and recommended repairs.',
+        tags: ['photo', 'visual-inspection', 'damage-assessment', 'maintenance'],
+        inputModes: ['text/plain', 'image/jpeg', 'image/png', 'image/webp'],
+        outputModes: ['text/plain'],
+        examples: ['What is wrong with this HVAC unit? [image]'],
+      },
+      {
+        id: 'maintenance-field',
+        name: 'Field Companion',
+        description: 'Real-time guidance for field technicians with urgency handling. Emergency queries are always free.',
+        tags: ['field-technician', 'emergency', 'safety', 'step-by-step'],
+        inputModes: ['text/plain'],
+        outputModes: ['text/plain'],
+        examples: ['Gas smell near water heater, urgency: emergency'],
+      },
+    ],
+  };
+
+  // Serve Agent Card at /.well-known/agent.json
+  app.get('/.well-known/agent.json', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.json(agentCard);
+  });
+  console.log('   Routes: /.well-known/agent.json (A2A Agent Card) registered ✅');
+
+  // Register A2A JSON-RPC 2.0 endpoint
+  const a2aRouter = require('./routes/a2a');
+  app.use('/a2a', a2aRouter);
+  console.log('   Routes: /a2a (A2A Protocol endpoint) registered ✅');
+}
+
 // ─── Certifications & Learning Platform (Day 13) ──────────────────────────────
 {
   const certificationsRouter = require('./routes/certifications');
@@ -1551,8 +1613,12 @@ app.listen(PORT, HOST, async () => {
   }
 });
 
-// ─── Diagram Search Endpoint (Bing Image Search) ─────────────────────────────
+// ─── Diagram Search Endpoint (Direct Parts Sites) ────────────────────────────
+// Scrapes model-specific pages directly from trusted parts sites.
+// More reliable than image search — goes straight to the source.
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyC52nkaB32oqX74oSs3yMMUVyyQ1huD5Ic';
+const DIAGRAM_GOOGLE_API_KEY = process.env.DIAGRAM_GOOGLE_API_KEY || 'AIzaSyCCXdJ_AP32DnwGBXRl2h8iyL534SvJMVU';
+const DIAGRAM_GOOGLE_CSE_ID = process.env.DIAGRAM_GOOGLE_CSE_ID || '';
 
 // In-memory diagram cache (TTL: 24h)
 const diagramCache = new Map();
@@ -1565,80 +1631,171 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
-// Blocked image domains known to serve inappropriate/unrelated content
-const BLOCKED_IMAGE_DOMAINS = [
-  'pinterest.com', 'pin.it', 'pinimg.com',
-  'reddit.com', 'redd.it', 'imgur.com',
-  'tumblr.com', 'flickr.com', 'deviantart.com',
-  'shutterstock.com', 'gettyimages.com', 'istockphoto.com',
-  'alamy.com', 'dreamstime.com', '123rf.com',
-  'facebook.com', 'fbcdn.net', 'instagram.com',
-  'tiktok.com', 'twitter.com', 'x.com',
-  // Low-quality / unrelated diagram sources
-  'blogspot.com', 'schematron.org', 'alicdn.com', 'alibaba.com',
-  'researchgate.net', 'academia.edu', 'dhiasite', 'reviewmotors.co',
-  'circuitblaze.com', 'wiring-diagram', 'wiringdiagram', 'diagramsite',
-  'amazon.com', 'ebay.com', 'walmart.com', 'etsy.com',
-  // Cloud storage buckets used to host random blog/spam content
-  'storage.googleapis.com', 'blob.core.windows.net', 'web.core.windows.net',
-  'cloudfront.net', 's3.amazonaws.com',
-  // Misc junk
-  'detoxicrecenze.com', 'wixsite.com', 'weebly.com', 'squarespace.com',
-];
+// ─── Direct Parts Site Scrapers ─────────────────────────────────────────────
+// Each function hits a specific trusted parts site with the model number
+// and extracts diagram/parts images from known page structures.
 
-// Allowed image domains for diagrams/parts (prioritized)
-const TRUSTED_DIAGRAM_DOMAINS = [
-  'repairclinic.com', 'partselect.com', 'appliancepartspros.com',
-  'searspartsdirect.com', 'partsdr.com', 'genuinereplacementparts.com',
-  'managemylife.com', 'justanswer.com', 'fixya.com',
-  'applianceaid.com', 'acservicetech.com', 'hvac-talk.com',
-  'grainger.com', 'supplyhouse.com', 'carrier.com', 'trane.com',
-  'lennox.com', 'rheem.com', 'goodmanmfg.com',
-];
+const PARTS_FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
 
-async function searchBingImages(query, limit = 15) {
-  // ENFORCE SafeSearch=Strict to filter explicit content
-  const url = `https://www.bing.com/images/search?q=${encodeURIComponent(query)}&first=1&safeSearch=Strict&adlt=strict`;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cookie': 'SRCHHPGUSR=ADLT=STRICT; _EDGE_S=SID=SAFE'
-    }
-  });
-  const html = await res.text();
-
-  // Extract structured image data from Bing's m= attribute JSON blocks
-  const mAttrRegex = /class="iusc"[^>]*m="([^"]+)"/g;
-  const blocks = [...html.matchAll(mAttrRegex)];
-
-  return blocks.slice(0, limit).map(b => {
-    const decoded = b[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-    try {
-      const data = JSON.parse(decoded);
-      const imageUrl = data.murl || '';
-      const sourceUrl = data.purl || '';
-      const urlLower = (imageUrl + ' ' + sourceUrl).toLowerCase();
-
-      // Block images from known inappropriate/unrelated domains
-      if (BLOCKED_IMAGE_DOMAINS.some(domain => urlLower.includes(domain))) {
-        return null;
+// Extract all image URLs matching a pattern from HTML
+function extractImages(html, patterns, source, contextUrl) {
+  const results = [];
+  for (const { regex, titleFn } of patterns) {
+    let match;
+    const re = new RegExp(regex.source, regex.flags);
+    while ((match = re.exec(html)) !== null && results.length < 8) {
+      const imageUrl = match[1] || match[2] || '';
+      if (!imageUrl || imageUrl.length < 10) continue;
+      const fullUrl = imageUrl.startsWith('http') ? imageUrl : `https://${source}${imageUrl}`;
+      if (!results.find(r => r.imageUrl === fullUrl)) {
+        results.push({
+          imageUrl: fullUrl,
+          thumbnailUrl: fullUrl,
+          title: titleFn ? titleFn(match) : 'Parts Diagram',
+          source,
+          contextUrl,
+        });
       }
-
-      return {
-        imageUrl,
-        thumbnailUrl: data.turl || data.murl || '',
-        title: data.t || data.desc || 'Parts Diagram',
-        source: (data.purl || '').replace(/^https?:\/\//, '').replace(/\/.*$/, ''),
-        contextUrl: data.purl || '',
-      };
-    } catch (e) {
-      return null;
     }
-  }).filter(Boolean);
+  }
+  return results;
 }
 
+// PartSelect: partselect.com/Models/{model}.htm
+async function scrapePartSelect(modelNumber) {
+  const url = `https://www.partselect.com/Models/${encodeURIComponent(modelNumber)}.htm`;
+  try {
+    const res = await fetch(url, { headers: PARTS_FETCH_HEADERS, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const html = await res.text();
+    // PartSelect embeds diagram images in .diagram-image or ps-diagram containers
+    const images = extractImages(html, [
+      { regex: /src="(https?:\/\/(?:www\.)?partselect\.(?:com|ca)[^"]+(?:diagram|exploded|parts)[^"]*\.(?:png|jpg|gif|webp))"/gi, titleFn: () => 'Parts Diagram' },
+      { regex: /data-src="(https?:\/\/(?:www\.)?partselect\.(?:com|ca)[^"]+\.(?:png|jpg|gif|webp))"/gi, titleFn: () => 'Parts View' },
+      { regex: /"imageUrl":"(https?:\/\/(?:www\.)?partselect[^"]+(?:diagram|exploded)[^"]*\.(?:png|jpg|gif|webp))"/gi, titleFn: () => 'Diagram' },
+    ], 'www.partselect.com', url);
+    console.log(`[diagrams/partselect] ${images.length} images for ${modelNumber}`);
+    return images;
+  } catch (err) {
+    console.warn(`[diagrams/partselect] Failed: ${err.message}`);
+    return [];
+  }
+}
+
+// RepairClinic: search by model number
+async function scrapeRepairClinic(modelNumber) {
+  const searchUrl = `https://www.repairclinic.com/PartDetail/Search?query=${encodeURIComponent(modelNumber)}&lang=en`;
+  try {
+    const res = await fetch(searchUrl, { headers: PARTS_FETCH_HEADERS, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const images = extractImages(html, [
+      { regex: /src="(https?:\/\/[^"]*repairclinic[^"]+(?:diagram|exploded|parts|PLDM)[^"]*\.(?:png|jpg|gif|webp))"/gi, titleFn: () => 'Parts Diagram' },
+      { regex: /data-original="(https?:\/\/[^"]*repairclinic[^"]+\.(?:png|jpg|gif|webp))"/gi, titleFn: () => 'Parts View' },
+      // Sears/RC shared CDN diagram images
+      { regex: /src="(https?:\/\/[^"]*\.(?:png|gif)(?:\?[^"]*)?)"[^>]*class="[^"]*diagram[^"]*"/gi, titleFn: () => 'Diagram' },
+    ], 'www.repairclinic.com', searchUrl);
+    console.log(`[diagrams/repairclinic] ${images.length} images for ${modelNumber}`);
+    return images;
+  } catch (err) {
+    console.warn(`[diagrams/repairclinic] Failed: ${err.message}`);
+    return [];
+  }
+}
+
+// AppliancePartsPros: direct model search
+async function scrapeAppliancePartsPros(modelNumber) {
+  const url = `https://www.appliancepartspros.com/parts-for-${encodeURIComponent(modelNumber.toLowerCase().replace(/\s+/g,'-'))}.html`;
+  try {
+    const res = await fetch(url, { headers: PARTS_FETCH_HEADERS, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const images = extractImages(html, [
+      { regex: /src="(https?:\/\/[^"]*(?:t-esb6|appliancepartspros)[^"]+\.(?:png|jpg|gif|webp|gif))"/gi, titleFn: () => 'Parts Diagram' },
+      { regex: /"diagram_url":"([^"]+)"/gi, titleFn: () => 'Exploded Diagram' },
+    ], 'www.appliancepartspros.com', url);
+    console.log(`[diagrams/appliancepartspros] ${images.length} images for ${modelNumber}`);
+    return images;
+  } catch (err) {
+    console.warn(`[diagrams/appliancepartspros] Failed: ${err.message}`);
+    return [];
+  }
+}
+
+// SearsParts Direct CDN — direct diagram image URL patterns
+async function scrapeSearsPartsDirect(modelNumber) {
+  // Sears has a consistent CDN pattern for model diagrams
+  const searchUrl = `https://www.searspartsdirect.com/model/${encodeURIComponent(modelNumber)}`;
+  try {
+    const res = await fetch(searchUrl, { headers: PARTS_FETCH_HEADERS, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const images = extractImages(html, [
+      { regex: /src="(https?:\/\/[^"]*searspartsdirect[^"]*(?:PLDM|diagram)[^"]*\.(?:png|jpg|gif))"/gi, titleFn: () => 'Parts Diagram' },
+      { regex: /src="(https?:\/\/c\.searspartsdirect\.com\/[^"]+\.(?:png|gif))"/gi, titleFn: () => 'Parts View' },
+    ], 'www.searspartsdirect.com', searchUrl);
+    console.log(`[diagrams/searspartsdirect] ${images.length} images for ${modelNumber}`);
+    return images;
+  } catch (err) {
+    console.warn(`[diagrams/searspartsdirect] Failed: ${err.message}`);
+    return [];
+  }
+}
+
+// Google CSE fallback (if CSE ID is configured)
+async function searchGoogleCSE(modelNumber, applianceType) {
+  if (!DIAGRAM_GOOGLE_CSE_ID) return [];
+  const q = [modelNumber, applianceType, 'parts diagram exploded view'].filter(Boolean).join(' ');
+  const url = `https://www.googleapis.com/customsearch/v1?key=${DIAGRAM_GOOGLE_API_KEY}&cx=${DIAGRAM_GOOGLE_CSE_ID}&q=${encodeURIComponent(q)}&searchType=image&num=5&imgSize=medium&safe=active`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.items || []).map(item => ({
+      imageUrl:     item.link,
+      thumbnailUrl: item.image?.thumbnailLink || item.link,
+      title:        item.title || 'Parts Diagram',
+      source:       item.displayLink || '',
+      contextUrl:   item.image?.contextLink || '',
+    }));
+  } catch (err) {
+    console.warn(`[diagrams/google-cse] Failed: ${err.message}`);
+    return [];
+  }
+}
+
+// Main diagram search — runs all scrapers in parallel, dedupes, returns best results
+async function searchDiagramsMultiSource(modelNumber, applianceType) {
+  const [partselect, repairclinic, appliancepartspros, sears, googleCse] = await Promise.allSettled([
+    scrapePartSelect(modelNumber),
+    scrapeRepairClinic(modelNumber),
+    scrapeAppliancePartsPros(modelNumber),
+    scrapeSearsPartsDirect(modelNumber),
+    searchGoogleCSE(modelNumber, applianceType),
+  ]);
+
+  const allImages = [
+    ...(partselect.status === 'fulfilled' ? partselect.value : []),
+    ...(repairclinic.status === 'fulfilled' ? repairclinic.value : []),
+    ...(appliancepartspros.status === 'fulfilled' ? appliancepartspros.value : []),
+    ...(sears.status === 'fulfilled' ? sears.value : []),
+    ...(googleCse.status === 'fulfilled' ? googleCse.value : []),
+  ];
+
+  // Deduplicate by imageUrl
+  const seen = new Set();
+  return allImages.filter(img => {
+    if (!img.imageUrl || seen.has(img.imageUrl)) return false;
+    seen.add(img.imageUrl);
+    return true;
+  });
+}
+
+// ─── Diagram Search Route ────────────────────────────────────────────────────
 app.get('/api/diagrams/search', async (req, res) => {
   const { modelNumber, issue, applianceType } = req.query;
 
@@ -1646,41 +1803,21 @@ app.get('/api/diagrams/search', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Missing modelNumber parameter' });
   }
 
-  // Check cache first
   const cacheKey = `${modelNumber}:${issue || ''}:${applianceType || ''}`;
   const cached = diagramCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < DIAGRAM_CACHE_TTL) {
     console.log(`[diagrams] Cache hit for ${modelNumber}`);
-    return res.json({ success: true, modelNumber, fromCache: true, count: cached.images.length, images: cached.images });
+    return res.json({ success: true, modelNumber, fromCache: true, count: cached.images.length, images: cached.images, source: 'cache' });
   }
 
   try {
-    // Build search query
-    const queryParts = [modelNumber];
-    if (applianceType) queryParts.push(applianceType);
-    queryParts.push(issue ? `${issue} diagram parts` : 'parts diagram exploded view');
-    const query = queryParts.join(' ');
-
-    console.log(`[diagrams] Searching Bing Images: ${query}`);
-    const images = await searchBingImages(query, 15);
-
-    // Sort: trusted domains first, then others
-    const trusted = images.filter(img =>
-      TRUSTED_DIAGRAM_DOMAINS.some(d => (img.imageUrl + img.contextUrl).toLowerCase().includes(d))
-    );
-    const others = images.filter(img =>
-      !TRUSTED_DIAGRAM_DOMAINS.some(d => (img.imageUrl + img.contextUrl).toLowerCase().includes(d))
-    );
-    // If we have 3+ trusted results, only return trusted — no junk mixed in
-    const sortedImages = trusted.length >= 3 ? trusted : [...trusted, ...others];
-
-    // Cache the sorted results
-    diagramCache.set(cacheKey, { images: sortedImages, timestamp: Date.now() });
-
-    console.log(`[diagrams] Found ${sortedImages.length} images for ${modelNumber} (${trusted.length} trusted)`);
-    res.json({ success: true, modelNumber, query, fromCache: false, count: sortedImages.length, images: sortedImages });
+    console.log(`[diagrams] Multi-source scrape for: ${modelNumber}`);
+    const images = await searchDiagramsMultiSource(modelNumber, applianceType);
+    diagramCache.set(cacheKey, { images, timestamp: Date.now() });
+    console.log(`[diagrams] Found ${images.length} images for ${modelNumber}`);
+    res.json({ success: true, modelNumber, fromCache: false, count: images.length, images, source: 'direct' });
   } catch (err) {
-    console.error(`[diagrams] Search error for ${modelNumber}:`, err.message);
+    console.error(`[diagrams] Error for ${modelNumber}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -1834,8 +1971,11 @@ app.post('/api/auth/verify-email', async (req, res) => {
     if (!profile) return res.status(404).json({ success: false, error: 'User not found' });
     if (profile.email_verified) return res.json({ success: true, alreadyVerified: true });
 
-    // Check token match
-    if (profile.verification_token !== token) {
+    // Check token match — accept full token OR the 6-char short code shown in the email
+    const storedToken = profile.verification_token || '';
+    const shortCode = storedToken.substring(0, 6).toUpperCase();
+    const tokenMatches = storedToken === token || shortCode === token.toUpperCase();
+    if (!tokenMatches) {
       return res.status(400).json({ success: false, error: 'Invalid verification token' });
     }
 
@@ -1946,6 +2086,12 @@ app.post('/api/auth/confirm-email', async (req, res) => {
 
     const { error } = await admin.auth.admin.updateUser(userId, { email_confirm: true });
     if (error) throw new Error(error.message);
+
+    // Also mark email_verified in profiles so app doesn’t show verify screen
+    const sb = require('./lib/supabase');
+    await sb.from('profiles')
+      .update({ email_verified: true, verification_token: null, verification_token_expires_at: null })
+      .eq('id', userId);
 
     console.log(`[auth] Email auto-confirmed for user ${userId}`);
 
