@@ -477,34 +477,41 @@ app.get('/api/health', async (req, res) => {
   }
 
   // ── 4. Cloud Run reachability ───────────────────────────────────
+  // Skip when running ON Cloud Run (K_SERVICE is set) — no point pinging ourselves externally.
+  // Only the DigitalOcean server does this outbound reachability check.
   const CLOUD_RUN_URL = process.env.CLOUD_RUN_URL || 'https://maintmentor-api-878722550029.us-east1.run.app';
-  try {
-    const https = require('https');
-    const t0 = Date.now();
-    await Promise.race([
-      new Promise((resolve, reject) => {
-        const url = new URL(CLOUD_RUN_URL + '/api/health');
-        const opts = {
-          hostname: url.hostname,
-          path: url.pathname,
-          method: 'GET',
-          timeout: 4000,
-        };
-        const req3 = https.request(opts, (resp) => {
-          resp.resume(); // drain
-          resolve(resp.statusCode);
-        });
-        req3.on('error', reject);
-        req3.on('timeout', () => { req3.destroy(); reject(new Error('timeout')); });
-        req3.end();
-      }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
-    ]);
-    checks.cloudrun = { status: 'ok', latency_ms: Date.now() - t0, url: CLOUD_RUN_URL };
-  } catch (e) {
-    // Cloud Run errors do NOT fail health — log only
-    console.warn('[health] Cloud Run check failed (non-fatal):', e.message);
-    checks.cloudrun = { status: 'degraded', error: e.message, url: CLOUD_RUN_URL };
+  if (process.env.K_SERVICE) {
+    // Running on Cloud Run — self-check is always ok (we're already serving this request)
+    checks.cloudrun = { status: 'ok', note: 'self (skipped external ping)', url: CLOUD_RUN_URL };
+  } else {
+    try {
+      const https = require('https');
+      const t0 = Date.now();
+      await Promise.race([
+        new Promise((resolve, reject) => {
+          const url = new URL(CLOUD_RUN_URL + '/api/health');
+          const opts = {
+            hostname: url.hostname,
+            path: url.pathname,
+            method: 'GET',
+            timeout: 9000,  // allow up to 9s for Cloud Run cold start
+          };
+          const req3 = https.request(opts, (resp) => {
+            resp.resume(); // drain
+            resolve(resp.statusCode);
+          });
+          req3.on('error', reject);
+          req3.on('timeout', () => { req3.destroy(); reject(new Error('timeout')); });
+          req3.end();
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+      ]);
+      checks.cloudrun = { status: 'ok', latency_ms: Date.now() - t0, url: CLOUD_RUN_URL };
+    } catch (e) {
+      // Cloud Run errors do NOT fail health — log only
+      console.warn('[health] Cloud Run check failed (non-fatal):', e.message);
+      checks.cloudrun = { status: 'degraded', error: e.message, url: CLOUD_RUN_URL };
+    }
   }
 
   // ── Overall status ──────────────────────────────────────────────
@@ -1347,6 +1354,13 @@ registerBillingRoutes(app);
   const agentRouter = require('./routes/agent');
   app.use('/api/agent', agentRouter);
   console.log('   Routes: /api/agent registered ✅');
+}
+
+// ─── Property / Unit / Asset / IoT / QR Routes ─────────────────────────────────
+{
+  const propertiesRouter = require('./routes/properties');
+  app.use('/api/properties', propertiesRouter);
+  console.log('   Routes: /api/properties (IoT / QR) registered ✅');
 }
 
 // ─── A2A Protocol (Agent2Agent) ───────────────────────────────────────────────
