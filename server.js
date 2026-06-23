@@ -1702,6 +1702,88 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
+// ─── Shared Reports ──────────────────────────────────────────────────────────
+
+/**
+ * POST /api/share-report
+ * Store a report and return a shareable URL.
+ * Body: { report: MaintenanceReport }
+ * Returns: { token, url }
+ */
+app.post('/api/share-report', async (req, res) => {
+  try {
+    const { report } = req.body;
+    if (!report || typeof report !== 'object') {
+      return res.status(400).json({ error: 'report object required' });
+    }
+
+    // Generate a random token (32 hex chars)
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(16).toString('hex');
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 days
+
+    const sb = require('./lib/supabase');
+    const { error } = await sb
+      .from('shared_reports')
+      .insert({
+        token,
+        report_data: report,
+        expires_at: expiresAt,
+      });
+
+    if (error) throw new Error(error.message);
+
+    const APP_URL = process.env.APP_URL || 'https://maintmentor.ai';
+    const url = `${APP_URL}/report/${token}`;
+
+    console.log(`[share-report] Created shared report token=${token}`);
+    res.json({ token, url });
+  } catch (err) {
+    console.error('[share-report] POST error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/share-report/:token
+ * Retrieve a shared report by token.
+ * Returns: { report: MaintenanceReport }
+ */
+app.get('/api/share-report/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token) return res.status(400).json({ error: 'token required' });
+
+    const sb = require('./lib/supabase');
+    const { data, error } = await sb
+      .from('shared_reports')
+      .select('report_data, expires_at, view_count')
+      .eq('token', token)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    // Check expiry
+    if (new Date(data.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'Report has expired' });
+    }
+
+    // Increment view count (fire-and-forget)
+    sb.from('shared_reports')
+      .update({ view_count: (data.view_count || 0) + 1 })
+      .eq('token', token)
+      .then(() => {})
+      .catch(() => {});
+
+    res.json({ report: data.report_data });
+  } catch (err) {
+    console.error('[share-report] GET error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 app.listen(PORT, HOST, async () => {
   logger.info({ port: PORT, env: process.env.NODE_ENV || 'development' }, 'MaintMentor API started');
