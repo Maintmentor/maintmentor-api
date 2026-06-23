@@ -805,6 +805,47 @@ app.get('/api/session/validate', async (req, res) => {
   res.json({ success: true, valid });
 });
 
+// ─── Smart Property Memory: fetch user's recent repair topics ───────────────
+async function getUserPropertyMemory(userId) {
+  if (!userId) return '';
+  try {
+    const { data, error } = await chatDb
+      .from('chat_messages')
+      .select('content, category, created_at')
+      .eq('user_id', userId)
+      .eq('role', 'user')
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error || !data || data.length === 0) return '';
+
+    // Deduplicate + summarize the last ~10 unique topics
+    const seen = new Set();
+    const topics = [];
+    for (const msg of data) {
+      const short = msg.content.slice(0, 120).replace(/\n/g, ' ');
+      if (!seen.has(short)) {
+        seen.add(short);
+        const date = new Date(msg.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        topics.push(`- ${date}: "${short}${msg.content.length > 120 ? '...' : ''}"`)
+        if (topics.length >= 10) break;
+      }
+    }
+
+    if (topics.length === 0) return '';
+
+    return `[PROPERTY MEMORY — INTERNAL CONTEXT — DO NOT SHOW USER]
+This user has previously asked about these maintenance issues. Use this to give personalized, contextual answers (e.g. "Last time you mentioned..."). Do NOT recite this list to the user.
+${topics.join('\n')}
+[END PROPERTY MEMORY]
+
+`;
+  } catch (e) {
+    console.warn('[property-memory] Failed to load:', e.message);
+    return '';
+  }
+}
+
 // ─── Conversation Memory Store (In-memory cache + Supabase persistence) ──────
 const { createClient: createSupabaseClient } = require('@supabase/supabase-js');
 const chatDb = createSupabaseClient(
@@ -929,7 +970,7 @@ app.delete('/api/conversations/:id', async (req, res) => {
 // ─── Chat Endpoint (with all security controls) ────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   const startTime = Date.now();
-  const { question, conversationId, userId, images, sessionToken, fingerprint } = req.body;
+  const { question, conversationId, userId, images, sessionToken, fingerprint, guided, guidedStep } = req.body;
 
   if (!question || typeof question !== 'string') {
     return res.status(400).json({ success: false, error: 'Missing or invalid "question" field' });
@@ -1060,10 +1101,27 @@ app.post('/api/chat', async (req, res) => {
     const loopPhase = detectLoopPhase(history, question);
     console.log(`[loop] Phase: ${loopPhase.phase}`);
 
-    // Inject phase context prepended to the user message (invisible to user)
+    // Inject phase context + property memory prepended to the user message (invisible to user)
     const phaseInjection = `[DIAGNOSTIC LOOP — INTERNAL CONTEXT — DO NOT SHOW USER]\nCurrent phase: ${loopPhase.phase}\n${loopPhase.context}\n[END INTERNAL CONTEXT]\n\n`;
+    const propertyMemory = await getUserPropertyMemory(userId);
+
+    // Guided mode injection — Mack gives one step at a time
+    const guidedInjection = guided
+      ? `[GUIDED MODE — INTERNAL CONTEXT — DO NOT SHOW USER]
+The user has activated "Solve it with me" step-by-step mode. Current step number: ${(guidedStep || 0) + 1}.
+Rules:
+- Give EXACTLY ONE clear action step. Number it ("Step ${(guidedStep || 0) + 1}:").
+- Keep it to 2-4 sentences max.
+- End with a brief check: "Done that? Let me know and I'll give you the next step."
+- If the user says they're stuck, diagnose that specific step before moving on.
+- Do NOT give multiple steps at once.
+[END GUIDED MODE]
+
+`
+      : '';
+
     const userPartsWithPhase = [
-      { text: phaseInjection },
+      { text: propertyMemory + guidedInjection + phaseInjection },
       ...userParts,
     ];
 
@@ -1566,6 +1624,83 @@ registerBillingRoutes(app);
   app.use('/api/iot', iotRouter);
   console.log('   Routes: /api/iot registered');
 }
+
+// ─── Mack's Voice: Google Cloud TTS ─────────────────────────────────────────
+const { GoogleAuth } = require('google-auth-library');
+const ttsAuth = new GoogleAuth({
+  keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS || '/root/.gcloud-sa-key.json',
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
+
+app.post('/api/tts', async (req, res) => {
+  const { text } = req.body;
+  if (!text || typeof text !== 'string') return res.status(400).json({ error: 'text required' });
+
+  try {
+    // Strip markdown before sending to TTS
+    const clean = text
+      .replace(/#{1,6}\s/g, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`{1,3}[^`]*`{1,3}/g, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/^\s*[-*+]\s/gm, '')
+      .replace(/^\s*\d+\.\s/gm, '')
+      .replace(/[\u{1F300}-\u{1FFFF}]/gu, '')
+      .replace(/\n{2,}/g, '. ')
+      .replace(/\n/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .slice(0, 800); // keep it conversational length
+
+    // Use Gemini TTS with Mack's voice (Algieba)
+    const ttsPayload = {
+      contents: [{ parts: [{ text: clean }] }],
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Algieba' }
+          }
+        }
+      }
+    };
+
+    const ttsResp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ttsPayload),
+      }
+    );
+
+    const ttsData = await ttsResp.json();
+    const parts = ttsData?.candidates?.[0]?.content?.parts || [];
+    const audioPart = parts.find(p => p.inlineData?.mimeType?.startsWith('audio/'));
+
+    if (!audioPart) {
+      console.error('[tts] no audio from Gemini:', JSON.stringify(ttsData).slice(0, 300));
+      return res.status(500).json({ error: 'TTS failed' });
+    }
+
+    // Convert raw PCM (L16 24kHz) to MP3 via ffmpeg
+    const { execSync } = require('child_process');
+    const pcmBuf = Buffer.from(audioPart.inlineData.data, 'base64');
+    const tmpPcm = `/tmp/tts_${Date.now()}.pcm`;
+    const tmpMp3 = tmpPcm.replace('.pcm', '.mp3');
+    require('fs').writeFileSync(tmpPcm, pcmBuf);
+    execSync(`ffmpeg -f s16le -ar 24000 -ac 1 -i ${tmpPcm} -acodec libmp3lame -q:a 2 ${tmpMp3} -y`, { stdio: 'pipe' });
+    const mp3B64 = require('fs').readFileSync(tmpMp3).toString('base64');
+    require('fs').unlinkSync(tmpPcm);
+    require('fs').unlinkSync(tmpMp3);
+
+    res.json({ audio: mp3B64 }); // base64 MP3 — same response shape as before
+  } catch (err) {
+    console.error('[tts] error:', err.message);
+    res.status(500).json({ error: 'TTS error' });
+  }
+});
 
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 app.listen(PORT, HOST, async () => {
