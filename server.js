@@ -1731,7 +1731,7 @@ app.post('/api/tts', async (req, res) => {
       .replace(/\n/g, ' ')
       .replace(/\s{2,}/g, ' ')
       .trim()
-      .slice(0, 800); // keep it conversational length
+      .slice(0, 1200); // full answer up to ~1200 chars
 
     // Use Gemini TTS with Mack's voice (Algieba)
     const ttsPayload = {
