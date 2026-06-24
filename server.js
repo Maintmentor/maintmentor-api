@@ -1696,14 +1696,14 @@ app.post('/api/chat/stream', async (req, res) => {
       const summaryResult = await summaryModel.generateContent(
         `You are Mack, a maintenance expert. A user asked: "${question}"\n\n` +
         `Your full answer was: ${fullText}\n\n` +
-        `Now give a SHORT voice response — 2 to 3 sentences, max 60 words. ` +
+        `Now give a complete voice response covering all the key steps — max 150 words. ` +
         `Skip any preamble like "Hey there" or "Great question". ` +
-        `Get straight to the key actionable steps. Conversational tone. No lists.`
+        `Cover every important step the user needs. Conversational tone, no bullet lists, just natural speech.`
       );
       voiceSummary = summaryResult.response.text().trim();
     } catch (e) {
       // fallback: first 300 chars of the answer
-      voiceSummary = fullText.replace(/[#*`]/g, '').slice(0, 300).trim();
+      voiceSummary = fullText.replace(/[#*`\[\]]/g, '').replace(/\n/g, ' ').slice(0, 900).trim();
     }
 
     res.write(`data: ${JSON.stringify({ type: 'done', answer: fullText, voiceSummary })}\n\n`);
@@ -1749,7 +1749,7 @@ app.post('/api/tts', async (req, res) => {
       .replace(/\n/g, ' ')
       .replace(/\s{2,}/g, ' ')
       .trim()
-      .slice(0, 1200); // full answer up to ~1200 chars
+      .slice(0, 1500); // ~150 words of speech
 
     // Use Gemini TTS with Mack's voice (Algieba)
     const ttsPayload = {
