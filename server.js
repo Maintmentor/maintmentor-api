@@ -1688,7 +1688,25 @@ app.post('/api/chat/stream', async (req, res) => {
       }
     }
 
-    res.write(`data: ${JSON.stringify({ type: 'done', answer: fullText })}\n\n`);
+    // Generate a short voice summary — what Mack actually speaks
+    // Full text stays on screen; voice = key steps only (~30 seconds)
+    let voiceSummary = '';
+    try {
+      const summaryModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const summaryResult = await summaryModel.generateContent(
+        `You are Mack, a maintenance expert. A user asked: "${question}"\n\n` +
+        `Your full answer was: ${fullText}\n\n` +
+        `Now give a SHORT voice response — 2 to 3 sentences, max 60 words. ` +
+        `Skip any preamble like "Hey there" or "Great question". ` +
+        `Get straight to the key actionable steps. Conversational tone. No lists.`
+      );
+      voiceSummary = summaryResult.response.text().trim();
+    } catch (e) {
+      // fallback: first 300 chars of the answer
+      voiceSummary = fullText.replace(/[#*`]/g, '').slice(0, 300).trim();
+    }
+
+    res.write(`data: ${JSON.stringify({ type: 'done', answer: fullText, voiceSummary })}\n\n`);
     res.end();
 
     // Non-blocking: increment usage, save to DB
