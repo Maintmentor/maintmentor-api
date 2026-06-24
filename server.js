@@ -1947,7 +1947,75 @@ app.get('/api/share-report/:token', async (req, res) => {
 });
 
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
-app.listen(PORT, HOST, async () => {
+
+// ─── Gemini Live WebSocket Proxy ───────────────────────────────────────────
+const http  = require('http');
+const { WebSocketServer, WebSocket: WS } = require('ws');
+const LIVE_MODEL = 'models/gemini-2.0-flash-live-001';
+const LIVE_URL   = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
+
+const LIVE_SETUP = JSON.stringify({
+  setup: {
+    model: LIVE_MODEL,
+    generation_config: {
+      response_modalities: ['AUDIO', 'TEXT'],
+      speech_config: {
+        voice_config: { prebuilt_voice_config: { voice_name: 'Algieba' } }
+      }
+    },
+    system_instruction: {
+      parts: [{ text:
+        'You are Mack, a maintenance expert with 30 years of hands-on experience. ' +
+        'The user is talking to you via voice. Keep answers SHORT — 2 to 4 sentences max. ' +
+        'Lead with the most important step. Conversational, practical, no fluff.'
+      }]
+    }
+  }
+});
+
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on('connection', (clientWs) => {
+  console.log('[live] client connected');
+  const geminiWs = new WS(LIVE_URL);
+
+  geminiWs.on('open', () => {
+    console.log('[live] gemini connected, sending setup');
+    geminiWs.send(LIVE_SETUP);
+    clientWs.send(JSON.stringify({ type: 'ready' }));
+  });
+
+  // Gemini → Client
+  geminiWs.on('message', (data) => {
+    if (clientWs.readyState === WS.OPEN) clientWs.send(data);
+  });
+
+  // Client → Gemini
+  clientWs.on('message', (data) => {
+    if (geminiWs.readyState === WS.OPEN) geminiWs.send(data);
+  });
+
+  const cleanup = () => {
+    try { geminiWs.close(); } catch (_) {}
+    try { clientWs.close(); } catch (_) {}
+  };
+  clientWs.on('close', cleanup);
+  geminiWs.on('close', cleanup);
+  clientWs.on('error', cleanup);
+  geminiWs.on('error', (e) => { console.error('[live] gemini error:', e.message); cleanup(); });
+});
+
+const server = http.createServer(app);
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url?.startsWith('/api/live')) {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+server.listen(PORT, HOST, async () => {
   logger.info({ port: PORT, env: process.env.NODE_ENV || 'development' }, 'MaintMentor API started');
   console.log(`🔧 MaintMentor API running on 127.0.0.1:${PORT}`);
   console.log(`   Model: ${MODEL}`);
