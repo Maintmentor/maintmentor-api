@@ -1625,6 +1625,86 @@ registerBillingRoutes(app);
   console.log('   Routes: /api/iot registered');
 }
 
+// ─── Streaming Chat Endpoint ────────────────────────────────────────────────
+app.post('/api/chat/stream', async (req, res) => {
+  const { question, conversationId, userId, sessionToken, fingerprint } = req.body;
+  const ipAddress = req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress;
+
+  if (!question || typeof question !== 'string') {
+    return res.status(400).json({ error: 'Missing question' });
+  }
+
+  // Rate limit check
+  const rateLimitCheck = await checkDailyLimits(userId, false, ipAddress);
+  if (!rateLimitCheck.allowed) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.write(`data: ${JSON.stringify({ type: 'error', error: rateLimitCheck.reason })}\n\n`);
+    return res.end();
+  }
+
+  // Topic check
+  const topicCheck = checkTopic(question);
+  if (!topicCheck.onTopic) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.write(`data: ${JSON.stringify({ type: 'chunk', text: topicCheck.deflectionMessage })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'done', answer: topicCheck.deflectionMessage })}\n\n`);
+    return res.end();
+  }
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+  res.flushHeaders();
+
+  try {
+    const modelChoice = selectModel(question, false, 0);
+    const streamModel = genAI.getGenerativeModel({
+      model: modelChoice.model,
+      systemInstruction: SYSTEM_PROMPT,
+    });
+
+    const history = await getConversationHistory(conversationId);
+    const geminiHistory = [];
+    for (const msg of history) {
+      const role = msg.role === 'assistant' ? 'model' : 'user';
+      geminiHistory.push({ role, parts: [{ text: typeof msg.content === 'string' ? msg.content : String(msg.content) }] });
+    }
+
+    const chat = streamModel.startChat({
+      history: geminiHistory,
+      generationConfig: { maxOutputTokens: 2048 },
+    });
+
+    const streamResult = await chat.sendMessageStream(question);
+    let fullText = '';
+
+    for await (const chunk of streamResult.stream) {
+      const text = chunk.text();
+      if (text) {
+        fullText += text;
+        res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
+      }
+    }
+
+    res.write(`data: ${JSON.stringify({ type: 'done', answer: fullText })}\n\n`);
+    res.end();
+
+    // Non-blocking: increment usage, save to DB
+    if (userId) incrementDailyQuery(userId).catch(() => {});
+    else if (ipAddress) {
+      // guest usage already incremented in checkGuestLimit
+    }
+    addToConversation(conversationId || 'anon', [{ type: 'text', text: question }], fullText);
+
+  } catch (err) {
+    console.error('[stream] error:', err.message);
+    res.write(`data: ${JSON.stringify({ type: 'error', error: 'Stream failed — please try again' })}\n\n`);
+    res.end();
+  }
+});
+
 // ─── Mack's Voice: Google Cloud TTS ─────────────────────────────────────────
 const { GoogleAuth } = require('google-auth-library');
 const ttsAuth = new GoogleAuth({
