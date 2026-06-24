@@ -135,9 +135,28 @@ function getTrialDay(profile) {
 /**
  * Check if user is within daily + hourly rate limits
  */
-async function checkDailyLimits(userId, isPhoto = false) {
+// Guest/anonymous IP-based limits
+const GUEST_DAILY_QUERY_LIMIT = 5;
+const guestUsage = new Map(); // ip -> { day, queryCount }
+
+function checkGuestLimit(ipAddress) {
+  if (!ipAddress) return { allowed: false, reason: 'Unable to verify request origin.' };
+  const day = todayKey();
+  let entry = guestUsage.get(ipAddress);
+  if (!entry || entry.day !== day) {
+    entry = { day, queryCount: 0 };
+    guestUsage.set(ipAddress, entry);
+  }
+  if (entry.queryCount >= GUEST_DAILY_QUERY_LIMIT) {
+    return { allowed: false, reason: `You've used your ${GUEST_DAILY_QUERY_LIMIT} free questions for today. Sign up for a free trial to keep going!` };
+  }
+  entry.queryCount++;
+  return { allowed: true };
+}
+
+async function checkDailyLimits(userId, isPhoto = false, ipAddress = null) {
   if (!userId) {
-    return { allowed: false, reason: 'Please sign in to use the AI chat. If you just signed in, try refreshing the page.', queryCount: 0, queryLimit: 0, photoCount: 0, photoLimit: 0 };
+    return checkGuestLimit(ipAddress);
   }
 
   try {

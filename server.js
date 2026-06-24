@@ -1015,7 +1015,7 @@ app.post('/api/chat', async (req, res) => {
 
   // ─── CONTROL 3: Daily rate limits ─────────────────────────────────────────
   const hasPhotos = images && Array.isArray(images) && images.length > 0;
-  const rateLimitCheck = await checkDailyLimits(userId, hasPhotos);
+  const rateLimitCheck = await checkDailyLimits(userId, hasPhotos, ipAddress);
   if (!rateLimitCheck.allowed) {
     console.log(`[${new Date().toISOString()}] Rate limit hit — user: ${userId}, reason: ${rateLimitCheck.reason}`);
     return res.status(429).json({
