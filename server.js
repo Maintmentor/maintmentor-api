@@ -1800,6 +1800,70 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
+// ─── TTS Streaming Endpoint (returns MP3 directly — iOS-friendly) ─────────────
+app.get('/api/tts-stream', async (req, res) => {
+  const text = req.query.text;
+  if (!text || typeof text !== 'string' || text.trim() === 'warmup') {
+    // Return a tiny silent MP3 for warmup calls
+    const { execSync } = require('child_process');
+    const tmpSilent = `/tmp/silence_${Date.now()}.mp3`;
+    try {
+      execSync(`ffmpeg -f lavfi -i anullsrc=r=24000:cl=mono -t 0.1 -acodec libmp3lame ${tmpSilent} -y`, { stdio: 'pipe' });
+      const silentBuf = require('fs').readFileSync(tmpSilent);
+      require('fs').unlinkSync(tmpSilent);
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.send(silentBuf);
+    } catch (e) {
+      return res.status(500).json({ error: 'silence failed' });
+    }
+  }
+
+  try {
+    const clean = text.replace(/[#*`\[\]]/g, '').replace(/\n/g, ' ').trim().slice(0, 1500);
+
+    const ttsPayload = {
+      contents: [{ parts: [{ text: clean }] }],
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Algieba' } } }
+      }
+    };
+
+    const ttsResp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(ttsPayload) }
+    );
+
+    const ttsData = await ttsResp.json();
+    const parts = ttsData?.candidates?.[0]?.content?.parts || [];
+    const audioPart = parts.find(p => p.inlineData?.mimeType?.startsWith('audio/'));
+    if (!audioPart) return res.status(500).json({ error: 'no audio' });
+
+    const { execSync } = require('child_process');
+    const fs = require('fs');
+    const pcmBuf = Buffer.from(audioPart.inlineData.data, 'base64');
+    const tmpPcm = `/tmp/tts_${Date.now()}.pcm`;
+    const tmpMp3 = tmpPcm.replace('.pcm', '.mp3');
+    fs.writeFileSync(tmpPcm, pcmBuf);
+    execSync(`ffmpeg -f s16le -ar 24000 -ac 1 -i ${tmpPcm} -acodec libmp3lame -q:a 2 ${tmpMp3} -y`, { stdio: 'pipe' });
+    const mp3Buf = fs.readFileSync(tmpMp3);
+    fs.unlinkSync(tmpPcm);
+    fs.unlinkSync(tmpMp3);
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', mp3Buf.length);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(mp3Buf);
+
+  } catch (err) {
+    console.error('[tts-stream] error:', err.message);
+    res.status(500).json({ error: 'TTS stream error' });
+  }
+});
+
 // ─── Shared Reports ──────────────────────────────────────────────────────────
 
 /**

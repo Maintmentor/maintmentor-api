@@ -20,6 +20,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
+const { requireJWT } = require('../middleware/auth');
 const { generateApiKey, hashApiKey, getKeyPrefix } = require('../lib/apiKeys');
 const { getOrCreateWallet } = require('../lib/wallet');
 const { stripe, getActiveCreditPacks, getCreditPackById } = require('../lib/stripe');

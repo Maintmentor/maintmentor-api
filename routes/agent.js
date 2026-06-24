@@ -676,6 +676,10 @@ async function fetchImageAsInlinePart(url) {
   }
 
   const response = await fetchFn(url, {
+    headers: {
+      'User-Agent': 'MaintMentor/1.0 (+https://maintmentor.ai)',
+      'Accept': 'image/*',
+    },
     signal: AbortSignal.timeout(15000), // 15s timeout per image
   });
 
