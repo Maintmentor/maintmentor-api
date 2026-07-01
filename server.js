@@ -1951,23 +1951,30 @@ const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs
 // ─── Gemini Live WebSocket Proxy ───────────────────────────────────────────
 const http  = require('http');
 const { WebSocketServer, WebSocket: WS } = require('ws');
-const LIVE_MODEL = 'models/gemini-2.0-flash-live-001';
-const LIVE_URL   = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
+const LIVE_MODEL = 'models/gemini-2.5-flash-native-audio-latest';
+const LIVE_URL   = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
 const LIVE_SETUP = JSON.stringify({
   setup: {
     model: LIVE_MODEL,
     generation_config: {
-      response_modalities: ['AUDIO', 'TEXT'],
+      // Native audio model only supports AUDIO output
+      response_modalities: ['AUDIO'],
       speech_config: {
-        voice_config: { prebuilt_voice_config: { voice_name: 'Algieba' } }
+        voice_config: { prebuilt_voice_config: { voice_name: 'Puck' } }
       }
+    },
+    // Get text transcript alongside audio
+    output_audio_transcription: {},
+    // PTT mode: disable automatic VAD — user controls turn via clientContent.turnComplete
+    realtime_input_config: {
+      automatic_activity_detection: { disabled: true }
     },
     system_instruction: {
       parts: [{ text:
-        'You are Mack, a maintenance expert with 30 years of hands-on experience. ' +
-        'The user is talking to you via voice. Keep answers SHORT — 2 to 4 sentences max. ' +
-        'Lead with the most important step. Conversational, practical, no fluff.'
+        'You are MaintMentor, a voice-first AI field companion for maintenance technicians. ' +
+        'Answer questions about HVAC, electrical, plumbing, and general residential maintenance. ' +
+        'Keep answers short and practical — 2 to 3 sentences max. The tech is in the field.'
       }]
     }
   }
@@ -2041,6 +2048,15 @@ server.listen(PORT, HOST, async () => {
       }, 24 * 60 * 60 * 1000);
     }, 60 * 1000);
     console.log('   Anomaly digest: ✅ wired (60s delay, then 24h interval)');
+
+    // Start MQTT subscriber (local Mosquitto broker)
+    try {
+      const mqttBridge = require('./lib/mqtt');
+      mqttBridge.start();
+      console.log('   MQTT bridge: ✅ started (mqtt://localhost:1883)');
+    } catch (mqttErr) {
+      console.error('   MQTT bridge: ⚠️  failed to start —', mqttErr.message);
+    }
 
     // Wire weekly progress email batch — runs every 7 days
     // (scans all active users and sends individual weekly summaries)
