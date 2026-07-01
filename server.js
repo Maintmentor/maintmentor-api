@@ -1985,21 +1985,36 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (clientWs) => {
   console.log('[live] client connected');
   const geminiWs = new WS(LIVE_URL);
+  let setupComplete = false;
 
   geminiWs.on('open', () => {
-    console.log('[live] gemini connected, sending setup');
+    console.log('[live] gemini WS open, sending setup');
     geminiWs.send(LIVE_SETUP);
-    clientWs.send(JSON.stringify({ type: 'ready' }));
+    // ⚠️  Do NOT send 'ready' here — wait for Gemini's setupComplete first
   });
 
   // Gemini → Client
   geminiWs.on('message', (data) => {
-    if (clientWs.readyState === WS.OPEN) clientWs.send(data);
+    if (clientWs.readyState !== WS.OPEN) return;
+    // Forward raw message
+    clientWs.send(data);
+    // Also send our custom 'ready' signal once (and only once) after setupComplete
+    if (!setupComplete) {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.setupComplete !== undefined) {
+          setupComplete = true;
+          console.log('[live] setupComplete — session ready');
+          clientWs.send(JSON.stringify({ type: 'ready' }));
+        }
+      } catch (_) {}
+    }
   });
 
   // Client → Gemini
   clientWs.on('message', (data) => {
     if (geminiWs.readyState === WS.OPEN) geminiWs.send(data);
+    else console.warn('[live] client sent before gemini ready');
   });
 
   const cleanup = () => {
@@ -2007,7 +2022,10 @@ wss.on('connection', (clientWs) => {
     try { clientWs.close(); } catch (_) {}
   };
   clientWs.on('close', cleanup);
-  geminiWs.on('close', cleanup);
+  geminiWs.on('close', (code, reason) => {
+    console.log('[live] gemini closed:', code, reason?.toString()?.slice(0, 80));
+    cleanup();
+  });
   clientWs.on('error', cleanup);
   geminiWs.on('error', (e) => { console.error('[live] gemini error:', e.message); cleanup(); });
 });
