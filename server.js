@@ -1949,24 +1949,59 @@ app.get('/api/share-report/:token', async (req, res) => {
 const HOST = process.env.K_SERVICE ? '0.0.0.0' : '127.0.0.1'; // Cloud Run needs 0.0.0.0
 
 // ─── Gemini Live WebSocket Proxy ───────────────────────────────────────────
-const http  = require('http');
+const http   = require('http');
+const crypto = require('crypto');
 const { WebSocketServer, WebSocket: WS } = require('ws');
+
 const LIVE_MODEL = 'models/gemini-2.5-flash-native-audio-latest';
 const LIVE_URL   = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
+
+// ── Voice token auth (prevents unauthorized use of /api/live) ────────────
+const VOICE_SECRET = process.env.VOICE_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+const ALLOWED_ORIGINS = new Set([
+  'https://maintmentor.ai',
+  'https://www.maintmentor.ai',
+]);
+
+function makeVoiceToken(userId) {
+  const expires = Date.now() + 2 * 60 * 1000; // 2 minutes
+  const payload = `${userId}:${expires}`;
+  const sig = crypto.createHmac('sha256', VOICE_SECRET).update(payload).digest('hex');
+  return Buffer.from(`${payload}:${sig}`).toString('base64url');
+}
+
+function validateVoiceToken(token) {
+  try {
+    const decoded = Buffer.from(token, 'base64url').toString();
+    const lastColon = decoded.lastIndexOf(':');
+    if (lastColon === -1) return false;
+    const payload = decoded.slice(0, lastColon);
+    const sig     = decoded.slice(lastColon + 1);
+    const colons  = payload.split(':');
+    const expires = parseInt(colons[colons.length - 1], 10);
+    if (isNaN(expires) || Date.now() > expires) return false;
+    const expected = crypto.createHmac('sha256', VOICE_SECRET).update(payload).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'));
+  } catch { return false; }
+}
+
+// Endpoint: authenticated users get a short-lived voice token
+const { requireJWT } = require('./middleware/auth');
+app.get('/api/voice-token', requireJWT, (req, res) => {
+  const token = makeVoiceToken(req.user.id);
+  res.json({ token, expiresIn: 120 });
+});
 
 const LIVE_SETUP = JSON.stringify({
   setup: {
     model: LIVE_MODEL,
     generation_config: {
-      // Native audio model only supports AUDIO output
       response_modalities: ['AUDIO'],
       speech_config: {
         voice_config: { prebuilt_voice_config: { voice_name: 'Puck' } }
       }
     },
-    // Get text transcript alongside audio
     output_audio_transcription: {},
-    // PTT mode: disable automatic VAD — user controls turn via clientContent.turnComplete
     realtime_input_config: {
       automatic_activity_detection: { disabled: true }
     },
@@ -1983,28 +2018,32 @@ const LIVE_SETUP = JSON.stringify({
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on('connection', (clientWs) => {
-  console.log('[live] client connected');
-  const geminiWs = new WS(LIVE_URL);
-  let setupComplete = false;
+  console.log('[live] session started');
+  const geminiWs  = new WS(LIVE_URL);
+  let setupDone   = false;
+  let cleanedUp   = false;   // guard against double-cleanup
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    try { geminiWs.close(1000); } catch (_) {}
+    try { clientWs.close(1000); } catch (_) {}
+  };
 
   geminiWs.on('open', () => {
-    console.log('[live] gemini WS open, sending setup');
+    console.log('[live] gemini connected — awaiting setupComplete');
     geminiWs.send(LIVE_SETUP);
-    // ⚠️  Do NOT send 'ready' here — wait for Gemini's setupComplete first
   });
 
-  // Gemini → Client
+  // Gemini → Client (raw pass-through; inject 'ready' after setupComplete)
   geminiWs.on('message', (data) => {
     if (clientWs.readyState !== WS.OPEN) return;
-    // Forward raw message
     clientWs.send(data);
-    // Also send our custom 'ready' signal once (and only once) after setupComplete
-    if (!setupComplete) {
+    if (!setupDone) {
       try {
-        const msg = JSON.parse(data.toString());
-        if (msg.setupComplete !== undefined) {
-          setupComplete = true;
-          console.log('[live] setupComplete — session ready');
+        if (JSON.parse(data.toString()).setupComplete !== undefined) {
+          setupDone = true;
+          console.log('[live] setupComplete — signalling client ready');
           clientWs.send(JSON.stringify({ type: 'ready' }));
         }
       } catch (_) {}
@@ -2014,30 +2053,51 @@ wss.on('connection', (clientWs) => {
   // Client → Gemini
   clientWs.on('message', (data) => {
     if (geminiWs.readyState === WS.OPEN) geminiWs.send(data);
-    else console.warn('[live] client sent before gemini ready');
+    else console.warn('[live] drop: gemini not open');
   });
 
-  const cleanup = () => {
-    try { geminiWs.close(); } catch (_) {}
-    try { clientWs.close(); } catch (_) {}
-  };
-  clientWs.on('close', cleanup);
+  clientWs.on('close',  cleanup);
+  clientWs.on('error',  cleanup);
   geminiWs.on('close', (code, reason) => {
-    console.log('[live] gemini closed:', code, reason?.toString()?.slice(0, 80));
+    console.log(`[live] gemini closed ${code}:`, reason?.toString()?.slice(0, 60));
     cleanup();
   });
-  clientWs.on('error', cleanup);
-  geminiWs.on('error', (e) => { console.error('[live] gemini error:', e.message); cleanup(); });
+  geminiWs.on('error', (e) => {
+    console.error('[live] gemini error:', e.message);
+    cleanup();
+  });
 });
 
 const server = http.createServer(app);
 
 server.on('upgrade', (req, socket, head) => {
-  if (req.url?.startsWith('/api/live')) {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-  } else {
+  if (!req.url?.startsWith('/api/live')) {
     socket.destroy();
+    return;
   }
+
+  // ── Auth: origin + signed token ──────────────────────────────────────────
+  const origin = req.headers.origin || '';
+  if (!ALLOWED_ORIGINS.has(origin)) {
+    console.warn('[live] rejected: bad origin:', origin);
+    socket.write('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  let tokenParam = '';
+  try {
+    tokenParam = new URL(req.url, 'https://api.maintmentor.ai').searchParams.get('token') || '';
+  } catch (_) {}
+
+  if (!validateVoiceToken(tokenParam)) {
+    console.warn('[live] rejected: invalid/expired token');
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
 server.listen(PORT, HOST, async () => {
