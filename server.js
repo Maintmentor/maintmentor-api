@@ -849,8 +849,8 @@ ${topics.join('\n')}
 // ─── Conversation Memory Store (In-memory cache + Supabase persistence) ──────
 const { createClient: createSupabaseClient } = require('@supabase/supabase-js');
 const chatDb = createSupabaseClient(
-  process.env.SUPABASE_URL || 'https://rxzbnvvtzhgogeuhajvp.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY || 'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY 
 );
 
 const conversationStore = new Map();
@@ -1259,8 +1259,8 @@ app.post('/api/payment/check-duplicate', async (req, res) => {
   try {
     const { createClient } = require('@supabase/supabase-js');
     const supabase = createClient(
-      process.env.SUPABASE_URL || 'https://rxzbnvvtzhgogeuhajvp.supabase.co',
-      process.env.SUPABASE_SERVICE_KEY || 'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY 
     );
 
     // Check for existing cards with same fingerprint
@@ -1306,8 +1306,8 @@ app.get('/api/conversations/access', async (req, res) => {
   try {
     const { createClient } = require('@supabase/supabase-js');
     const supabase = createClient(
-      process.env.SUPABASE_URL || 'https://rxzbnvvtzhgogeuhajvp.supabase.co',
-      process.env.SUPABASE_SERVICE_KEY || 'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY 
     );
 
     const { data: profile } = await supabase
@@ -1957,10 +1957,15 @@ const LIVE_MODEL = 'models/gemini-2.5-flash-native-audio-latest';
 const LIVE_URL   = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
 // ── Voice token auth (prevents unauthorized use of /api/live) ────────────
-const VOICE_SECRET = process.env.VOICE_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+const VOICE_SECRET = process.env.VOICE_TOKEN_SECRET || (() => {
+  console.warn('[WARN] VOICE_TOKEN_SECRET not set — using ephemeral secret. Tokens will be invalidated on restart. Set this env var in production.');
+  return crypto.randomBytes(32).toString('hex');
+})();
 const ALLOWED_ORIGINS = new Set([
   'https://maintmentor.ai',
   'https://www.maintmentor.ai',
+  // Dev origins (safe because tokens still required)
+  ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:5173', 'http://localhost:3000'] : []),
 ]);
 
 function makeVoiceToken(userId) {
@@ -2171,8 +2176,8 @@ server.listen(PORT, HOST, async () => {
 // ─── Diagram Search Endpoint (Direct Parts Sites) ────────────────────────────
 // Scrapes model-specific pages directly from trusted parts sites.
 // More reliable than image search — goes straight to the source.
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyC52nkaB32oqX74oSs3yMMUVyyQ1huD5Ic';
-const DIAGRAM_GOOGLE_API_KEY = process.env.DIAGRAM_GOOGLE_API_KEY || 'AIzaSyCCXdJ_AP32DnwGBXRl2h8iyL534SvJMVU';
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const DIAGRAM_GOOGLE_API_KEY = process.env.DIAGRAM_GOOGLE_API_KEY;
 const DIAGRAM_GOOGLE_CSE_ID = process.env.DIAGRAM_GOOGLE_CSE_ID || '';
 
 // In-memory diagram cache (TTL: 24h)
@@ -2558,17 +2563,38 @@ app.post('/api/auth/verify-email', async (req, res) => {
   }
 });
 
+// Simple in-memory rate limit: max 3 resends per userId per hour
+const _resendRateMap = new Map(); // userId -> [{ts}]
+function checkResendRateLimit(userId) {
+  const now = Date.now();
+  const window = 60 * 60 * 1000; // 1 hour
+  const max = 3;
+  const hits = (_resendRateMap.get(userId) || []).filter(ts => now - ts < window);
+  if (hits.length >= max) return false;
+  hits.push(now);
+  _resendRateMap.set(userId, hits);
+  return true;
+}
+
 app.post('/api/auth/resend-verification', async (req, res) => {
   try {
     const { userId, userEmail, userName } = req.body;
     if (!userId || !userEmail) {
       return res.status(400).json({ success: false, error: 'userId and userEmail are required' });
     }
+    // UUID format check
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid userId format' });
+    }
+    // Rate limit: max 3 resends per userId per hour
+    if (!checkResendRateLimit(userId)) {
+      return res.status(429).json({ success: false, error: 'Too many requests. Please wait before resending.' });
+    }
 
     const { createClient } = require('@supabase/supabase-js');
     const sb = createClient(
-      'https://rxzbnvvtzhgogeuhajvp.supabase.co',
-      'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY
     );
 
     // Generate a new token and store it
@@ -2628,16 +2654,35 @@ app.post('/api/auth/resend-verification', async (req, res) => {
 });
 
 // ─── Auto-confirm email after signup (bypasses Supabase email verification) ───
+// Security: only valid within 5 minutes of account creation (tight window prevents
+// arbitrary email confirmation of existing accounts via userId enumeration)
 app.post('/api/auth/confirm-email', async (req, res) => {
   try {
     const { userId, email, name } = req.body;
     if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
 
+    // Validate userId is a valid UUID to prevent injection
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid userId format' });
+    }
+
     const { createClient } = require('@supabase/supabase-js');
     const admin = createClient(
-      'https://rxzbnvvtzhgogeuhajvp.supabase.co',
-      'sb_secret_ZippXnI12gbtsKswpk0O4w_V1_A5EiU'
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY
     );
+
+    // Only allow confirmation within 5 minutes of account creation
+    const { data: userData, error: fetchErr } = await admin.auth.admin.getUserById(userId);
+    if (fetchErr || !userData?.user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    const createdAt = new Date(userData.user.created_at).getTime();
+    const ageMs = Date.now() - createdAt;
+    if (ageMs > 5 * 60 * 1000) {
+      console.warn(`[auth] confirm-email rejected: account ${userId} is ${Math.round(ageMs/1000)}s old`);
+      return res.status(403).json({ success: false, error: 'Confirmation window expired' });
+    }
 
     const { error } = await admin.auth.admin.updateUser(userId, { email_confirm: true });
     if (error) throw new Error(error.message);
